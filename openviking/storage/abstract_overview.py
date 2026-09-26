@@ -662,6 +662,7 @@ async def read_abstract_overview_pending_snapshot(
     dir_uri: str,
     ctx: Optional[RequestContext],
     lock: Optional[Dict[str, Any]] = None,
+    lock_timeout_secs: float = 0.0,
 ) -> int:
     """Read the pending counter captured at the start of an aggregation."""
 
@@ -688,7 +689,9 @@ async def read_abstract_overview_pending_snapshot(
         if all(document is None for document in preliminary):
             return 0
         lock_paths = [viking_fs._uri_to_path(uri, ctx=ctx) for uri in uris]
-        snapshot_lease = await viking_fs._async_agfs.pathlock_acquire_exact_batch(lock_paths)
+        snapshot_lease = await viking_fs._async_agfs.pathlock_acquire_exact_batch(
+            lock_paths, timeout_secs=lock_timeout_secs
+        )
     try:
         return _pending_of([await _read_existing_document(viking_fs, uri, ctx) for uri in uris])
     finally:

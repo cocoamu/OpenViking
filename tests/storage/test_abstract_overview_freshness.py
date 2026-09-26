@@ -45,6 +45,17 @@ class _FakeFS:
         return None
 
 
+@pytest.mark.asyncio
+async def test_pending_snapshot_uses_bounded_lock_wait():
+    dir_uri = "viking://resources/wide"
+    fs = _FakeFS(_files(dir_uri))
+    await read_abstract_overview_pending_snapshot(
+        viking_fs=fs, dir_uri=dir_uri, ctx=None, lock_timeout_secs=1.0
+    )
+    assert fs.lock_timeouts == [1.0]
+    assert not fs._lock.locked()
+
+
 def _files(dir_uri, *, total=161, pending=3):
     metadata = {"freshness": freshness_metadata(total, min(total, 32), pending)}
     return {

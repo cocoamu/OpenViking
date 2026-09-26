@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0
 
 import re
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -56,7 +57,7 @@ class _FakeVikingFS:
         self._file_contents[norm_path] = content
         self.writes.append((norm_path, content))
 
-    async def pathlock_acquire_exact_batch(self, paths):
+    async def pathlock_acquire_exact_batch(self, paths, timeout_secs=0.0):
         return {"paths": paths}
 
     async def pathlock_release(self, lease):
@@ -283,6 +284,36 @@ async def test_content_write_tags_apply_only_to_changed_file(monkeypatch):
 
     assert processor.file_ingest_options == {changed_uri: tag_options}
     assert processor.directory_ingest_options[root_uri] == IngestOptions()
+
+
+@pytest.mark.asyncio
+async def test_busy_snapshot_propagates_for_queue_retry_then_recovers(monkeypatch):
+    root_uri = "viking://resources/root"
+    fake_fs = _FakeVikingFS(tree={root_uri: []}, file_contents={})
+    monkeypatch.setattr("openviking.storage.queuefs.semantic_dag.get_viking_fs", lambda: fake_fs)
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_dag.get_openviking_config",
+        lambda: SimpleNamespace(semantic=SimpleNamespace(overview_sample_limit=32)),
+    )
+    snapshot = AsyncMock(side_effect=LockAcquisitionError("sidecars are busy"))
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_dag.read_abstract_overview_pending_snapshot", snapshot
+    )
+    processor = _FakeProcessor(fake_fs)
+    ctx = RequestContext(user=UserIdentifier("acc1", "user1"), role=Role.USER)
+
+    def executor():
+        return SemanticDagExecutor(processor=processor, context_type="resource",
+                                   max_concurrent_llm=2, ctx=ctx, recursive=False)
+
+    with pytest.raises(LockAcquisitionError):
+        await asyncio.wait_for(executor().run(root_uri), timeout=2)
+    assert snapshot.await_args.kwargs["lock_timeout_secs"] == 1.0
+    assert fake_fs.writes == []
+
+    snapshot.side_effect = None
+    snapshot.return_value = 0
+    await asyncio.wait_for(executor().run(root_uri), timeout=2)
 
 
 @pytest.mark.asyncio

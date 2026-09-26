@@ -412,6 +412,7 @@ class SemanticDagExecutor:
                         dir_uri=dir_uri,
                         ctx=self._ctx,
                         lock=self._lock,
+                        lock_timeout_secs=1.0,
                     )
                 except LockAcquisitionError:
                     if self._generation_trigger != "content_write":
@@ -474,7 +475,7 @@ class SemanticDagExecutor:
             return False
         except Exception as e:
             logger.error(f"Failed to dispatch directory {dir_uri}: {e}", exc_info=True)
-            if self._generation_trigger == "content_copy":
+            if self._generation_trigger == "content_copy" or isinstance(e, LockAcquisitionError):
                 raise
             if parent_uri:
                 await self._on_child_done(parent_uri, dir_uri, "")

@@ -79,25 +79,31 @@ async def _measure_embedding_call_async(
         raise
 
 
-def _create_sync_ark(kwargs: Dict[str, Any]):
+def _create_sync_ark(kwargs: Dict[str, Any], timeout: float):
     client_kwargs = dict(kwargs)
     http_client = create_optional_sync_httpx_client(
         client_kwargs.get("base_url"),
-        timeout=60.0,
+        timeout=timeout,
     )
     if http_client is not None:
         client_kwargs["http_client"] = http_client
+    client_kwargs["timeout"] = timeout
+    # OpenViking owns retry policy and its total budget. Avoid multiplying it
+    # with the Ark SDK's implicit retry loop.
+    client_kwargs["max_retries"] = 0
     return volcenginesdkarkruntime.Ark(**client_kwargs)
 
 
-def _create_async_ark(kwargs: Dict[str, Any]):
+def _create_async_ark(kwargs: Dict[str, Any], timeout: float):
     client_kwargs = dict(kwargs)
     http_client = create_optional_async_httpx_client(
         client_kwargs.get("base_url"),
-        timeout=60.0,
+        timeout=timeout,
     )
     if http_client is not None:
         client_kwargs["http_client"] = http_client
+    client_kwargs["timeout"] = timeout
+    client_kwargs["max_retries"] = 0
     return volcenginesdkarkruntime.AsyncArk(**client_kwargs)
 
 
@@ -200,7 +206,7 @@ class VolcengineDenseEmbedder(DenseEmbedderBase):
         ark_kwargs = {"api_key": self.api_key}
         if self.api_base:
             ark_kwargs["base_url"] = self.api_base
-        self.client = _create_sync_ark(ark_kwargs)
+        self.client = _create_sync_ark(ark_kwargs, self.timeout)
         self._ark_kwargs = ark_kwargs
         self._async_client_cache = LoopScopedAsyncClientCache()
 
@@ -312,7 +318,7 @@ class VolcengineDenseEmbedder(DenseEmbedderBase):
 
     def _get_async_client(self):
         return self._async_client_cache.get(
-            lambda: _create_async_ark(self._ark_kwargs)
+            lambda: _create_async_ark(self._ark_kwargs, self.timeout)
         )
 
     async def embed_async(self, content: "EmbeddingInput", is_query: bool = False) -> EmbedResult:
@@ -403,7 +409,7 @@ class VolcengineSparseEmbedder(SparseEmbedderBase):
         ark_kwargs = {"api_key": self.api_key}
         if self.api_base:
             ark_kwargs["base_url"] = self.api_base
-        self.client = _create_sync_ark(ark_kwargs)
+        self.client = _create_sync_ark(ark_kwargs, self.timeout)
         self._ark_kwargs = ark_kwargs
         self._async_client_cache = LoopScopedAsyncClientCache()
 
@@ -481,7 +487,7 @@ class VolcengineSparseEmbedder(SparseEmbedderBase):
 
     def _get_async_client(self):
         return self._async_client_cache.get(
-            lambda: _create_async_ark(self._ark_kwargs)
+            lambda: _create_async_ark(self._ark_kwargs, self.timeout)
         )
 
     async def embed_async(self, content: "EmbeddingInput", is_query: bool = False) -> EmbedResult:
@@ -571,7 +577,7 @@ class VolcengineHybridEmbedder(HybridEmbedderBase):
         ark_kwargs = {"api_key": self.api_key}
         if self.api_base:
             ark_kwargs["base_url"] = self.api_base
-        self.client = _create_sync_ark(ark_kwargs)
+        self.client = _create_sync_ark(ark_kwargs, self.timeout)
         self._ark_kwargs = ark_kwargs
         self._async_client_cache = LoopScopedAsyncClientCache()
         self._dimension = dimension or 2048
@@ -666,7 +672,7 @@ class VolcengineHybridEmbedder(HybridEmbedderBase):
 
     def _get_async_client(self):
         return self._async_client_cache.get(
-            lambda: _create_async_ark(self._ark_kwargs)
+            lambda: _create_async_ark(self._ark_kwargs, self.timeout)
         )
 
     async def embed_async(self, content: "EmbeddingInput", is_query: bool = False) -> EmbedResult:

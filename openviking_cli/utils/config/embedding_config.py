@@ -650,6 +650,11 @@ class EmbeddingConfig(BaseModel):
         default=3,
         description="Maximum retry attempts for embedding provider calls (0 disables retry)",
     )
+    timeout: float = Field(
+        default=60.0,
+        gt=0,
+        description="Timeout in seconds for each embedding provider call",
+    )
     text_source: str = Field(
         default=TEXT_SOURCE_CONTENT_ONLY,
         description="Text source for file vectorization: summary_first|content_only",
@@ -753,6 +758,7 @@ class EmbeddingConfig(BaseModel):
             "max_retries": self.max_retries,
             "max_concurrent": self.max_concurrent,
             "max_input_tokens": self.max_input_tokens,
+            "timeout": self.timeout,
         }
 
         factory_registry = {

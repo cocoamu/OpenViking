@@ -263,6 +263,7 @@ class EmbedderBase(ABC):
         self.max_input_tokens = resolve_embedding_max_input_tokens(self.config)
         self.max_retries = int(self.config.get("max_retries", 3))
         self.max_concurrent = int(self.config.get("max_concurrent", 10))
+        self.timeout = float(self.config.get("timeout", 60.0))
         self.provider = self.config.get("provider", "unknown")
 
         # Token usage tracking

@@ -4,13 +4,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import heapq
 import json
 from collections.abc import Awaitable, Callable
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from copy import deepcopy
-from typing import Any, Dict, List, Optional, Protocol
+from typing import Any, AsyncIterator, Dict, List, Optional, Protocol
 
 from openviking.pyagfs import AsyncAGFSClient
+from openviking.pyagfs.async_client import fs_ctx_from_agfs_path
 from openviking.pyagfs.exceptions import AGFSAlreadyExistsError, AGFSNotFoundError
 from openviking.service.task_tracker_concurrency import StoreIOLimiter, run_to_completion
 
@@ -59,9 +63,46 @@ class PersistentTaskStore:
     SYSTEM_DIRNAME = "_system"
     TASKS_DIRNAME = "tasks"
 
-    def __init__(self, agfs: Any) -> None:
+    def __init__(self, agfs: Any, *, distributed_writes: bool = False) -> None:
         self._agfs = agfs if isinstance(agfs, AsyncAGFSClient) else AsyncAGFSClient(agfs)
         self._ensured_task_dirs: set[tuple[str, str]] = set()
+        self.distributed_writes = distributed_writes
+        self._active_lease: ContextVar[tuple[str, Dict[str, Any]] | None] = ContextVar(
+            "task_store_active_lease", default=None
+        )
+
+    @asynccontextmanager
+    async def lock_task(
+        self, task_id: str, *, account_id: str, user_id: str
+    ) -> AsyncIterator[None]:
+        if not self.distributed_writes:
+            yield
+            return
+        await self._ensure_task_dir(account_id, user_id)
+        path = self._task_path(account_id, user_id, task_id)
+        lease = await self._agfs.pathlock_acquire_exact(path, timeout_secs=30.0)
+        token = self._active_lease.set((path, lease))
+        try:
+            yield
+        finally:
+            self._active_lease.reset(token)
+            await run_to_completion(lambda: self._agfs.pathlock_release(lease))
+
+    @asynccontextmanager
+    async def lock_business(
+        self, account_id: str, user_id: str, task_type: str, resource_id: str
+    ) -> AsyncIterator[None]:
+        if not self.distributed_writes:
+            yield
+            return
+        await self._ensure_task_dir(account_id, user_id)
+        key = "\0".join((account_id, user_id, task_type, resource_id)).encode("utf-8")
+        path = f"{self._task_dir(account_id, user_id)}/.business-{hashlib.sha256(key).hexdigest()}"
+        lease = await self._agfs.pathlock_acquire_exact(path, timeout_secs=30.0)
+        try:
+            yield
+        finally:
+            await run_to_completion(lambda: self._agfs.pathlock_release(lease))
 
     async def create(self, task: Any) -> None:
         await self._write_task(task)
@@ -80,7 +121,10 @@ class PersistentTaskStore:
             return None
         path = self._task_path(account_id, user_id, task_id)
         try:
-            raw = await self._agfs.read(path)
+            fs_ctx = fs_ctx_from_agfs_path(path)
+            if self.distributed_writes:
+                fs_ctx["bypass_cache"] = "true"
+            raw = await self._agfs.read(path, fs_ctx=fs_ctx)
         except (AGFSNotFoundError, FileNotFoundError):
             return None
         return json.loads(_decode_bytes(raw))
@@ -88,7 +132,11 @@ class PersistentTaskStore:
     async def list(self, account_id: str, *, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
         if user_id is None:
             try:
-                owners = await self._agfs.ls(self._task_root_dir(account_id))
+                root = self._task_root_dir(account_id)
+                fs_ctx = fs_ctx_from_agfs_path(root)
+                if self.distributed_writes:
+                    fs_ctx["bypass_cache"] = "true"
+                owners = await self._agfs.ls(root, fs_ctx=fs_ctx)
             except (AGFSNotFoundError, FileNotFoundError):
                 return []
             tasks: List[Dict[str, Any]] = []
@@ -98,7 +146,10 @@ class PersistentTaskStore:
             return tasks
         directory = self._task_dir(account_id, user_id)
         try:
-            items = await self._agfs.ls(directory)
+            fs_ctx = fs_ctx_from_agfs_path(directory)
+            if self.distributed_writes:
+                fs_ctx["bypass_cache"] = "true"
+            items = await self._agfs.ls(directory, fs_ctx=fs_ctx)
         except (AGFSNotFoundError, FileNotFoundError):
             return []
         tasks: List[Dict[str, Any]] = []
@@ -107,7 +158,10 @@ class PersistentTaskStore:
             if not path.endswith(".json"):
                 continue
             try:
-                raw = await self._agfs.read(path)
+                fs_ctx = fs_ctx_from_agfs_path(path)
+                if self.distributed_writes:
+                    fs_ctx["bypass_cache"] = "true"
+                raw = await self._agfs.read(path, fs_ctx=fs_ctx)
             except (AGFSNotFoundError, FileNotFoundError):
                 continue
             tasks.append(json.loads(_decode_bytes(raw)))
@@ -138,7 +192,12 @@ class PersistentTaskStore:
 
         directory = self._task_dir(account_id, user_id)
         try:
-            entries = await read("list_page_ls", lambda: self._agfs.ls(directory))
+            fs_ctx = fs_ctx_from_agfs_path(directory)
+            if self.distributed_writes:
+                fs_ctx["bypass_cache"] = "true"
+            entries = await read(
+                "list_page_ls", lambda: self._agfs.ls(directory, fs_ctx=fs_ctx)
+            )
         except (AGFSNotFoundError, FileNotFoundError):
             return []
         heap: list = []
@@ -147,9 +206,17 @@ class PersistentTaskStore:
             if not path.endswith(".json"):
                 continue
             try:
+                fs_ctx = fs_ctx_from_agfs_path(path)
+                if self.distributed_writes:
+                    fs_ctx["bypass_cache"] = "true"
                 task = json.loads(
                     _decode_bytes(
-                        await read("list_page_read", lambda path=path: self._agfs.read(path))
+                        await read(
+                            "list_page_read",
+                            lambda path=path, fs_ctx=fs_ctx: self._agfs.read(
+                                path, fs_ctx=fs_ctx
+                            ),
+                        )
                     )
                 )
             except (AGFSNotFoundError, FileNotFoundError):
@@ -174,10 +241,13 @@ class PersistentTaskStore:
         """Delete a task record, succeeding if it has already been removed."""
         if not user_id:
             return
+        path = self._task_path(account_id, user_id, task_id)
+        fs_ctx = self._write_fs_ctx(path)
         try:
             await self._agfs.rm(
-                self._task_path(account_id, user_id, task_id),
+                path,
                 force=True,
+                fs_ctx=fs_ctx,
                 auto_pathlock=False,
             )
         except (AGFSNotFoundError, FileNotFoundError):
@@ -220,12 +290,18 @@ class PersistentTaskStore:
         )
 
     async def _write_task_payload(self, path: str, payload: bytes) -> None:
-        # TaskTracker is the owner of task mutations and serializes updates per
-        # task. PersistentTaskStore does not implement store-level revision/CAS,
-        # so AGFS pathlock cannot make multiple independent writers correct; it
-        # only adds one storage lock around every task lifecycle write. Avoid
-        # that extra PathLock overhead on this internal task file.
-        await self._agfs.write(path, payload, auto_pathlock=False)
+        await self._agfs.write(
+            path, payload, fs_ctx=self._write_fs_ctx(path), auto_pathlock=False
+        )
+
+    def _write_fs_ctx(self, path: str) -> Dict[str, str]:
+        ctx = fs_ctx_from_agfs_path(path)
+        if self.distributed_writes:
+            active = self._active_lease.get()
+            if active is None or active[0] != path:
+                raise RuntimeError("Task mutation requires its owned PathLock lease")
+            ctx["lease_ref"] = active[1]["lease_ref"]
+        return ctx
 
     async def _mkdir_if_missing(self, path: str) -> None:
         try:

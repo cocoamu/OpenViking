@@ -130,8 +130,9 @@ class QueueManager:
         # Import at composition time to avoid a service <-> queue package cycle.
         from openviking.service.task_queue_middleware import TaskWorkQueueMiddleware
 
+        self._task_middleware = TaskWorkQueueMiddleware(self._task_work_index)
         self._middlewares: tuple[QueueMiddleware, ...] = (
-            TaskWorkQueueMiddleware(self._task_work_index),
+            self._task_middleware,
             *middlewares,
         )
 
@@ -159,6 +160,28 @@ class QueueManager:
         owners = self._task_work_index.rebuild(snapshots)
         tracker.attach_work_index(self._task_work_index)
         return await tracker.restore_work_tasks(owners)
+
+    def attach_task_tracker(self, tracker: Any) -> None:
+        """Connect task coordination before queue producers or consumers start."""
+        tracker.attach_queue_manager(self)
+        self._task_middleware.attach_task_tracker(tracker)
+
+    async def has_task_work(
+        self, task_id: str, *, exclude_work_ids: frozenset[str] = frozenset()
+    ) -> bool:
+        """Check the shared QueueFS source of truth across every named queue."""
+        from openviking.service.task_work_index import extract_task_metadata
+
+        for queue in self._queues.values():
+            for message in await queue.snapshot():
+                metadata = extract_task_metadata(message)
+                if (
+                    metadata is not None
+                    and metadata.task_id == task_id
+                    and metadata.work_id not in exclude_work_ids
+                ):
+                    return True
+        return False
 
     def setup_standard_queues(self, vector_store: Any, start: bool = True) -> None:
         """

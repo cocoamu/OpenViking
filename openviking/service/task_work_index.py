@@ -222,7 +222,7 @@ class TaskWorkIndex:
             )
             return removed, became_idle
 
-    async def discard(self, queue_name: str, message: Any) -> None:
+    async def discard(self, queue_name: str, message: Any, *, finalize: bool = True) -> None:
         """Discard work that was never durably enqueued and finalize if it was last."""
         metadata = (
             message if isinstance(message, QueueTaskMetadata) else extract_task_metadata(message)
@@ -231,13 +231,15 @@ class TaskWorkIndex:
             return
         _removed, became_idle = self._remove_work(queue_name, metadata)
         callback = self._finalize_before_ack
-        if became_idle and callback is not None:
+        if finalize and became_idle and callback is not None:
             await callback(metadata)
 
     async def prepare_ack(
         self,
         queue_name: str,
         message: Any,
+        *,
+        finalize: bool = True,
     ) -> Optional[QueueTaskMetadata]:
         """Remove work provisionally and finalize its task before the last durable ACK."""
         metadata = (
@@ -253,7 +255,7 @@ class TaskWorkIndex:
             return metadata
 
         callback = self._finalize_before_ack
-        if callback is None:
+        if not finalize or callback is None:
             return metadata
         try:
             await callback(metadata)
@@ -275,6 +277,10 @@ class TaskWorkIndex:
                     for _queue_name, work_id in self._work.get(task_id, ())
                 )
             return bool(self._work.get(task_id) or self._active.get(task_id))
+
+    def has_active_work(self, task_id: str) -> bool:
+        with self._lock:
+            return bool(self._active.get(task_id))
 
     def cancellation_requested(self, task_id: str) -> bool:
         callback = self._is_cancellation_requested

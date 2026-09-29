@@ -206,7 +206,10 @@ class OpenVikingService:
             self._queue_manager.setup_standard_queues(self._vikingdb_manager, start=False)
 
         # PathLock has been moved to Rust ragfs; Python-layer LockManager is no longer needed.
-        set_task_tracker(config.build_task_tracker(self._agfs_client))
+        tracker = config.build_task_tracker(self._agfs_client)
+        set_task_tracker(tracker)
+        if self._queue_manager:
+            self._queue_manager.attach_task_tracker(tracker)
 
     def _build_ragfs_binding_config(self) -> Any:
         """Build the single runtime binding config from OpenViking storage + encryption settings."""

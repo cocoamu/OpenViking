@@ -603,7 +603,9 @@ class ReindexExecutor:
         ctx: RequestContext,
     ) -> None:
         tracker = get_task_tracker()
-        tracker.register_running_task(task_id)
+        worker_id = await tracker.register_running_task_shared(
+            task_id, account_id=ctx.account_id, user_id=ctx.user.user_id
+        )
         try:
             await tracker.start(task_id, account_id=ctx.account_id, user_id=ctx.user.user_id)
             with bind_task_context(task_id, ctx.account_id, ctx.user.user_id):
@@ -633,7 +635,12 @@ class ReindexExecutor:
                 user_id=ctx.user.user_id,
             )
         finally:
-            await tracker.unregister_running_task(task_id)
+            await tracker.unregister_running_task_shared(
+                task_id,
+                account_id=ctx.account_id,
+                user_id=ctx.user.user_id,
+                worker_id=worker_id,
+            )
 
     async def _prune_orphan_vectors(
         self,

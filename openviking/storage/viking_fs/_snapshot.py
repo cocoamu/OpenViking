@@ -863,7 +863,9 @@ class _SnapshotMixin:
         from openviking.service.task_work_index import bind_task_context
 
         tracker = get_task_tracker()
-        tracker.register_running_task(task_id)
+        worker_id = await tracker.register_running_task_shared(
+            task_id, account_id=ctx.account_id, user_id=ctx.user.user_id
+        )
         try:
             await tracker.start(
                 task_id,
@@ -899,7 +901,12 @@ class _SnapshotMixin:
                 user_id=ctx.user.user_id,
             )
         finally:
-            await tracker.unregister_running_task(task_id)
+            await tracker.unregister_running_task_shared(
+                task_id,
+                account_id=ctx.account_id,
+                user_id=ctx.user.user_id,
+                worker_id=worker_id,
+            )
 
     async def _run_vector_rebuild(
         self,

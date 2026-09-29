@@ -5,7 +5,9 @@
 
 import asyncio
 import json
+import threading
 import time
+from contextlib import asynccontextmanager
 from copy import deepcopy
 
 import pytest
@@ -67,6 +69,16 @@ class _FakeAgfs:
         self.mkdir_calls = []
         self.write_calls = []
         self.rm_calls = []
+        self.path_locks = {}
+
+    def pathlock_acquire_exact(self, ctx, path, timeout_secs=0, owner_lease_ref=None):
+        lock = self.path_locks.setdefault(path, threading.Lock())
+        if not lock.acquire(timeout=timeout_secs):
+            raise TimeoutError(path)
+        return {"lease_ref": path, "path": path}
+
+    def pathlock_release(self, ctx, lease):
+        self.path_locks[lease["path"]].release()
 
     def mkdir(self, path: str, mode: str = "755"):
         self.mkdir_calls.append({"path": path, "mode": mode})
@@ -636,6 +648,133 @@ async def test_persistent_store_cross_tracker_visibility():
     assert loaded.result == {"ok": True}
 
 
+async def test_persistent_store_cross_tracker_visibility_after_cached_read():
+    agfs = _FakeAgfs()
+    writer = TaskTracker(store=PersistentTaskStore(agfs))
+    reader = TaskTracker(store=PersistentTaskStore(agfs))
+
+    task = await writer.create("session_commit", resource_id="sess-123", **_owner_kwargs())
+    initial = await reader.get(task.task_id, **_owner_kwargs())
+    assert initial is not None
+    assert initial.status == TaskStatus.PENDING
+
+    await writer.start(task.task_id, **_owner_kwargs())
+    await writer.complete(task.task_id, {"ok": True}, **_owner_kwargs())
+
+    current = await reader.get(task.task_id, **_owner_kwargs())
+    assert current is not None
+    assert current.status == TaskStatus.COMPLETED
+    assert current.result == {"ok": True}
+
+
+async def test_persistent_store_stale_writer_cannot_reopen_completed_task():
+    agfs = _FakeAgfs()
+    writer = TaskTracker(store=PersistentTaskStore(agfs))
+    stale_writer = TaskTracker(store=PersistentTaskStore(agfs))
+
+    task = await writer.create("session_commit", **_owner_kwargs())
+    assert await stale_writer.get(task.task_id, **_owner_kwargs()) is not None
+    await writer.complete(task.task_id, {"ok": True}, **_owner_kwargs())
+
+    await stale_writer.start(task.task_id)
+
+    current = await writer._store.get(task.task_id, **_owner_kwargs())
+    assert current is not None
+    assert current["status"] == TaskStatus.COMPLETED.value
+    assert current["result"] == {"ok": True}
+
+
+async def test_persistent_store_auth_is_cleared_across_trackers():
+    agfs = _FakeAgfs()
+    writer = TaskTracker(store=PersistentTaskStore(agfs))
+    reader = TaskTracker(store=PersistentTaskStore(agfs))
+
+    task = await writer.create("session_commit", auth={"checkpoint": "temporary"}, **_owner_kwargs())
+    assert await reader.get_task_auth(task.task_id, **_owner_kwargs()) == {
+        "checkpoint": "temporary"
+    }
+
+    await writer.complete(task.task_id, {"ok": True}, **_owner_kwargs())
+
+    assert await reader.get_task_auth(task.task_id, **_owner_kwargs()) == {}
+
+
+async def test_persistent_store_concurrent_writers_cannot_reopen_completed_task():
+    agfs = _FakeAgfs()
+    start_waiting = asyncio.Event()
+    allow_start = asyncio.Event()
+
+    class PausedStore(PersistentTaskStore):
+        @asynccontextmanager
+        async def lock_task(self, task_id, *, account_id, user_id):
+            start_waiting.set()
+            await allow_start.wait()
+            async with super().lock_task(task_id, account_id=account_id, user_id=user_id):
+                yield
+
+    writer = TaskTracker(store=PersistentTaskStore(agfs, distributed_writes=True))
+    delayed_writer = TaskTracker(store=PausedStore(agfs, distributed_writes=True))
+    task = await writer.create("session_commit", **_owner_kwargs())
+
+    delayed_start = asyncio.create_task(delayed_writer.start(task.task_id, **_owner_kwargs()))
+    await asyncio.wait_for(start_waiting.wait(), timeout=2)
+    await writer.complete(task.task_id, {"ok": True}, **_owner_kwargs())
+    allow_start.set()
+    await delayed_start
+
+    current = await writer._store.get(task.task_id, **_owner_kwargs())
+    assert current is not None
+    assert current["status"] == TaskStatus.COMPLETED.value
+    assert current["result"] == {"ok": True}
+
+
+async def test_persistent_store_concurrent_business_create_is_unique():
+    agfs = _FakeAgfs()
+    first = TaskTracker(store=PersistentTaskStore(agfs, distributed_writes=True))
+    second = TaskTracker(store=PersistentTaskStore(agfs, distributed_writes=True))
+
+    created = await asyncio.gather(
+        first.create_if_no_running("add_resource", "resource-1", **_owner_kwargs()),
+        second.create_if_no_running("add_resource", "resource-1", **_owner_kwargs()),
+    )
+
+    assert sum(task is not None for task in created) == 1
+    records = await first._store.list("acme", user_id="alice")
+    assert len(records) == 1
+
+
+async def test_persistent_store_business_create_ignores_stale_local_cache():
+    agfs = _FakeAgfs()
+    writer = TaskTracker(store=PersistentTaskStore(agfs, distributed_writes=True))
+    reader = TaskTracker(store=PersistentTaskStore(agfs, distributed_writes=True))
+    original = await writer.create_if_no_running(
+        "add_resource", "resource-1", **_owner_kwargs()
+    )
+    assert original is not None
+    assert await reader.get(original.task_id, **_owner_kwargs()) is not None
+
+    await writer.complete(original.task_id, {"ok": True}, **_owner_kwargs())
+    reader._tasks[original.task_id].updated_at = time.time() + 100
+
+    following = await reader.create_if_no_running(
+        "add_resource", "resource-1", **_owner_kwargs()
+    )
+    assert following is not None
+    assert following.task_id != original.task_id
+
+
+async def test_persistent_store_expiry_keeps_fresh_record():
+    agfs = _FakeAgfs()
+    tracker = TaskTracker(store=PersistentTaskStore(agfs, distributed_writes=True))
+    task = await tracker.create("session_commit", **_owner_kwargs())
+    await tracker.complete(task.task_id, {"ok": True}, **_owner_kwargs())
+    tracker._tasks[task.task_id].updated_at = time.time() - tracker.TTL_COMPLETED - 1
+
+    await tracker._evict_expired()
+
+    assert await tracker._store.get(task.task_id, **_owner_kwargs()) is not None
+
+
 @pytest.mark.parametrize(
     "extra",
     [
@@ -916,6 +1055,40 @@ async def test_terminal_event_waits_for_owned_work(tracker, outcome):
     assert last["status"] == ("completed" if outcome == "complete" else "failed")
     await tracker.wait_for_descendants(task.task_id, "parent-work")
     assert (await tracker.get(task.task_id, **owner)).execution_events == snapshot.execution_events
+
+
+async def test_distributed_descendant_wait_uses_shared_queue_after_remote_ack():
+    from openviking.service.task_work_index import QueueTaskMetadata, TaskWorkIndex
+
+    class SharedQueue:
+        def __init__(self):
+            self.has_child = True
+
+        async def has_task_work(self, task_id, *, exclude_work_ids=frozenset()):
+            return self.has_child
+
+    tracker = TaskTracker(store=PersistentTaskStore(_FakeAgfs(), distributed_writes=True))
+    owner = _owner_kwargs()
+    task = await tracker.create("add_resource", **owner)
+    await tracker.start(task.task_id, **owner)
+    work_index = TaskWorkIndex()
+    tracker.attach_work_index(work_index)
+    shared = SharedQueue()
+    tracker.attach_queue_manager(shared)
+    child = QueueTaskMetadata(task.task_id, "child-work", "acme", "alice")
+    work_index.register("Semantic", child)
+    await tracker.complete(task.task_id, {"done": True}, **owner)
+
+    waiting = asyncio.create_task(tracker.wait_for_descendants(task.task_id, "parent-work"))
+    await asyncio.sleep(0)
+    assert not waiting.done()
+
+    # The child is ACKed by another Pod. The producer's local index is stale,
+    # while the shared QueueFS no longer reports durable work.
+    shared.has_child = False
+    await asyncio.wait_for(waiting, timeout=2)
+    await tracker._finalize_task(task.task_id, **owner)
+    assert (await tracker.get(task.task_id, **owner)).status.value == "completed"
 
 
 async def test_legacy_tasks_do_not_get_invented_history():

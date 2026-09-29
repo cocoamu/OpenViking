@@ -937,8 +937,23 @@ class TaskTracker:
         return deleted
 
     async def wait_for_descendants(self, task_id: str, current_work_id: str) -> None:
-        """Wait on the same durable work index used by completion and cancellation."""
-        if self._work_index.has_work(task_id, exclude_work_id=current_work_id):
+        """Wait until work other than the current queue delivery has settled.
+
+        In distributed mode, another Pod can ACK a child delivery. Its local
+        ``TaskWorkIndex`` cannot observe that ACK, so the shared QueueFS snapshot
+        is the authority for durable descendants. The local index remains useful
+        for the non-distributed in-memory backend.
+        """
+
+        async def has_descendants() -> bool:
+            if self.distributed_queue_enabled:
+                return await self._queue_manager.has_task_work(
+                    task_id,
+                    exclude_work_ids=frozenset({current_work_id}),
+                )
+            return self._work_index.has_work(task_id, exclude_work_id=current_work_id)
+
+        if await has_descendants():
             task = self._cached_task(task_id)
             if task and task.account_id and task.user_id:
                 await self.record_event(
@@ -948,7 +963,7 @@ class TaskTracker:
                     account_id=task.account_id,
                     user_id=task.user_id,
                 )
-        while self._work_index.has_work(task_id, exclude_work_id=current_work_id):
+        while await has_descendants():
             await asyncio.sleep(0.05)
 
     async def record_event(

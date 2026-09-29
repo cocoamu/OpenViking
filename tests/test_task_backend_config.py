@@ -1,6 +1,8 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
 
+import pytest
+
 from openviking.service.task_store import PersistentTaskStore
 from openviking.service.task_tracker import TaskTracker
 from openviking_cli.utils.config import storage_config as storage_config_module
@@ -54,3 +56,28 @@ def test_storage_config_builds_persistent_task_tracker():
     tracker = StorageConfig().build_task_tracker(_FakeAgfs())
     assert isinstance(tracker, TaskTracker)
     assert isinstance(tracker._store, PersistentTaskStore)
+    assert tracker._store.distributed_writes is False
+
+
+def test_storage_config_enables_distributed_task_writes():
+    tracker = StorageConfig(
+        distributed_task_writes=True,
+        agfs={
+            "queuefs": {"backend": "cache", "mode": "shared"},
+            "pathlock": {"provider": "cache", "namespace": "test"},
+        },
+    ).build_task_tracker(_FakeAgfs())
+    assert tracker._store.distributed_writes is True
+
+
+@pytest.mark.parametrize(
+    "agfs",
+    [
+        {"queuefs": {"backend": "sqlite", "mode": "shared"}},
+        {"queuefs": {"backend": "cache", "mode": "worker"}},
+        {"queuefs": {"backend": "cache", "mode": "shared"}},
+    ],
+)
+def test_storage_config_rejects_unshared_distributed_queue(agfs):
+    with pytest.raises(ValueError, match="requires shared cache-backed QueueFS and PathLock"):
+        StorageConfig(distributed_task_writes=True, agfs=agfs)

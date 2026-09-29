@@ -31,6 +31,10 @@ class StorageConfig(BaseModel):
             "the risk of multi-process contention on embedded vector storage."
         ),
     )
+    distributed_task_writes: bool = Field(
+        default=False,
+        description="Serialize task record mutations across instances with AGFS PathLock.",
+    )
 
     agfs: AGFSConfig = Field(default_factory=AGFSConfig, description="AGFS configuration")
 
@@ -65,6 +69,14 @@ class StorageConfig(BaseModel):
     @model_validator(mode="after")
     def resolve_paths(self):
         """Normalize storage paths and map legacy transaction settings into native pathlock config."""
+        if self.distributed_task_writes and (
+            self.agfs.queuefs.backend != "cache"
+            or self.agfs.queuefs.mode != "shared"
+            or self.agfs.pathlock.provider != "cache"
+        ):
+            raise ValueError(
+                "storage.distributed_task_writes requires shared cache-backed QueueFS and PathLock"
+            )
         if "lock_timeout" in self.transaction.model_fields_set:
             logger.warning(
                 "StorageConfig: 'transaction.lock_timeout' is deprecated and ignored. "
@@ -130,4 +142,8 @@ class StorageConfig(BaseModel):
         from openviking.service.task_store import PersistentTaskStore
         from openviking.service.task_tracker import TaskTracker
 
-        return TaskTracker(store=PersistentTaskStore(agfs))
+        return TaskTracker(
+            store=PersistentTaskStore(
+                agfs, distributed_writes=self.distributed_task_writes
+            )
+        )

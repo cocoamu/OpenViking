@@ -45,7 +45,10 @@ async def main(mode):
         {
             "backend": "local",
             "path": root,
-            "queuefs": {"backend": "cache", "cache_key_prefix": namespace},
+            "queuefs": {
+                "backend": "cache",
+                "cache_key_prefix": namespace,
+            },
             "pathlock": {"provider": "cache", "namespace": namespace},
         }
     )
@@ -73,10 +76,15 @@ async def main(mode):
         await tracker.complete(TASK_ID, {"ok": True}, account_id=ACCOUNT, user_id=USER)
         assert (await tracker.get(TASK_ID, account_id=ACCOUNT, user_id=USER)).status == TaskStatus.RUNNING
         assert len(await queue.snapshot()) == 1
-    elif mode == "claim":
+    elif mode in {"claim", "crash"}:
         message = await queue.dequeue_raw()
         assert message is not None
         assert (await tracker.get(TASK_ID, account_id=ACCOUNT, user_id=USER)).status == TaskStatus.RUNNING
+        if mode == "crash":
+            # Simulate a worker dying after dequeue and before ACK. The caller
+            # intentionally terminates this process without touching the queue.
+            print(f"{mode}: claimed message {message['id']} and exiting without ack")
+            return
     elif mode == "consume":
         index.rebuild({"AddResource": await queue.snapshot()})
         message = await queue.dequeue_raw()

@@ -1,5 +1,5 @@
-{{- if gt (int .Values.replicaCount) 1 }}
-{{- fail "replicaCount must be 1. OpenViking uses RocksDB which does not support concurrent access from multiple pods sharing the same PVC." }}
+{{- if and (gt (int .Values.replicaCount) 1) .Values.persistence.enabled }}
+{{- fail "replicaCount > 1 requires persistence.enabled=false; each pod must have its own local workspace while task records, QueueFS, PathLock, and vector data use shared external backends." }}
 {{- end }}
 apiVersion: apps/v1
 kind: Deployment
@@ -13,7 +13,11 @@ spec:
     matchLabels:
       {{- include "openviking.selectorLabels" . | nindent 6 }}
   strategy:
-    type: Recreate
+    type: {{ .Values.strategy.type }}
+    {{- if and (eq .Values.strategy.type "RollingUpdate") .Values.strategy.rollingUpdate }}
+    rollingUpdate:
+      {{- toYaml .Values.strategy.rollingUpdate | nindent 6 }}
+    {{- end }}
   template:
     metadata:
       annotations:
@@ -27,6 +31,7 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -96,6 +101,21 @@ spec:
       {{- end }}
       {{- with .Values.affinity }}
       affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- else }}
+      {{- if gt (int .Values.replicaCount) 1 }}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: {{ include "openviking.name" . }}
+                  app.kubernetes.io/instance: {{ .Release.Name }}
+              topologyKey: kubernetes.io/hostname
+      {{- end }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       {{- with .Values.tolerations }}

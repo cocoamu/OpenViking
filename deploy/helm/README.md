@@ -173,6 +173,53 @@ helm upgrade openviking ./deploy/helm/openviking -f my-values.yaml
 The deployment uses a `Recreate` strategy to avoid data corruption from
 multiple pods accessing the same RocksDB volume simultaneously.
 
+## Reliable two-replica mode
+
+Two replicas are supported only when the pod-local workspace is disposable and
+all state needed for task ownership is shared outside the pod. Configure the
+OpenViking file backend and vector database for their shared production
+services, then enable the Redis-backed QueueFS and PathLock settings:
+
+```yaml
+replicaCount: 2
+
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 0
+    maxSurge: 1
+
+# Each pod gets an independent emptyDir workspace. A shared RWO PVC is unsafe.
+persistence:
+  enabled: false
+
+config:
+  cache:
+    provider: redis
+    params:
+      endpoints: ["redis://<durable-redis-service>:6379"]
+      command_timeout_ms: 1000
+  storage:
+    workspace: /app/.openviking
+    distributed_task_writes: true
+    agfs:
+      queuefs:
+        backend: cache
+        mode: shared
+        cache_key_prefix: prod-openviking
+      pathlock:
+        provider: cache
+        namespace: prod-openviking
+        lock_expire_secs: 60
+```
+
+The chart automatically adds required node anti-affinity when
+`replicaCount > 1`. Before switching a production Service, verify that the
+external file store, vector database, and Redis use durable/shared storage and
+that both pods can read the same task records. The chart refuses
+`replicaCount > 1` while `persistence.enabled=true` so a release cannot mount
+the default per-release RWO workspace from two pods.
+
 ## Uninstalling
 
 ```bash

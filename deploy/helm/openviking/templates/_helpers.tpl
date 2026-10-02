@@ -74,6 +74,10 @@ Return the deployed app version label.
 Return the image name including tag.
 */}}
 {{- define "openviking.image" -}}
+{{- if .Values.image.digest -}}
+{{- printf "%s@%s" .Values.image.repository .Values.image.digest -}}
+{{- else -}}
 {{- $tag := default "latest" .Values.image.tag -}}
 {{- printf "%s:%s" .Values.image.repository $tag -}}
+{{- end -}}
 {{- end }}

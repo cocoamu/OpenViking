@@ -20,6 +20,9 @@ image:
   # Set to "main" for the newest image from the main branch, a version such as
   # "v0.3.17" for a pinned release, or "" to use latest.
   tag: latest
+  # Optional immutable digest. When set, the rendered image uses repository@digest
+  # and ignores tag for the image reference.
+  digest: ""
 
 imagePullSecrets: []
 nameOverride: ""
@@ -93,6 +96,8 @@ bot:
 # This is rendered into a ConfigMap and mounted at
 # ${persistence.mountPath}/ov.conf.
 config:
+  # Required when QueueFS, CacheFS, or PathLock uses a shared runtime backend.
+  cache: null
   storage:
     # Defaults to <persistence.mountPath>/openviking_workspace when empty.
     workspace: ""

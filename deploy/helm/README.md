@@ -29,6 +29,11 @@ helm upgrade --install openviking ./deploy/helm/openviking --set image.tag=main
 # pinned release image
 helm upgrade --install openviking ./deploy/helm/openviking --set image.tag=v0.3.17
 
+# immutable image reference (digest takes precedence over tag)
+helm upgrade --install openviking ./deploy/helm/openviking \
+  --set image.repository=registry.example/openviking \
+  --set image.digest=sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+
 # use the default latest image
 helm upgrade --install openviking ./deploy/helm/openviking --set image.tag=
 ```
@@ -146,6 +151,7 @@ Secrets.
 | `replicaCount` | Number of replicas | `1` |
 | `image.repository` | Container image repository | `ghcr.io/volcengine/openviking` |
 | `image.tag` | Container image tag (`latest`, `main`, pinned release, or empty for `latest`) | `latest` |
+| `image.digest` | Immutable image digest; rendered as `repository@digest` when set | `""` |
 | `image.pullPolicy` | Image pull policy | `Always` |
 | `service.type` | Kubernetes service type | `ClusterIP` |
 | `service.port` | Service port | `1933` |
@@ -197,7 +203,7 @@ config:
   cache:
     provider: redis
     params:
-      endpoints: ["redis://<durable-redis-service>:6379"]
+      endpoints: ["redis://<verified-durable-redis-service>:6379"]
       command_timeout_ms: 1000
   storage:
     workspace: /app/.openviking

@@ -1,6 +1,29 @@
 {{- if and (gt (int .Values.replicaCount) 1) .Values.persistence.enabled }}
 {{- fail "replicaCount > 1 requires persistence.enabled=false; each pod must have its own local workspace while task records, QueueFS, PathLock, and vector data use shared external backends." }}
 {{- end }}
+{{- if gt (int .Values.replicaCount) 1 }}
+{{- $cache := .Values.config.cache | default dict }}
+{{- if not .Values.config.storage.distributed_task_writes }}
+{{- fail "replicaCount > 1 requires config.storage.distributed_task_writes=true so task records use the shared backend." }}
+{{- end }}
+{{- if ne (default "" $cache.provider) "redis" }}
+{{- fail "replicaCount > 1 requires config.cache.provider=redis for shared QueueFS and PathLock state." }}
+{{- end }}
+{{- if ne (default "" .Values.config.storage.agfs.queuefs.backend) "cache" }}
+{{- fail "replicaCount > 1 requires storage.agfs.queuefs.backend=cache." }}
+{{- end }}
+{{- if ne (default "" .Values.config.storage.agfs.queuefs.mode) "shared" }}
+{{- fail "replicaCount > 1 requires storage.agfs.queuefs.mode=shared." }}
+{{- end }}
+{{- if ne (default "" .Values.config.storage.agfs.pathlock.provider) "cache" }}
+{{- fail "replicaCount > 1 requires storage.agfs.pathlock.provider=cache." }}
+{{- end }}
+{{- $params := default dict $cache.params }}
+{{- $endpoints := default (list) $params.endpoints }}
+{{- if eq (len $endpoints) 0 }}
+{{- fail "replicaCount > 1 requires at least one Redis endpoint in config.cache.params.endpoints." }}
+{{- end }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:

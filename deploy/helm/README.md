@@ -221,10 +221,12 @@ config:
 
 The chart automatically adds required node anti-affinity when
 `replicaCount > 1`. Before switching a production Service, verify that the
-external file store, vector database, and Redis use durable/shared storage and
+external AGFS file store, VectorDB, and Redis use durable/shared storage and
 that both pods can read the same task records. The chart refuses
 `replicaCount > 1` while `persistence.enabled=true` so a release cannot mount
-the default per-release RWO workspace from two pods.
+the default per-release RWO workspace from two pods. It also refuses a local AGFS
+or local VectorDB backend in two-replica mode, because those stores would diverge
+between pods even when task state is shared.
 
 ## Uninstalling
 

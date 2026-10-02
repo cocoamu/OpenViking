@@ -18,6 +18,13 @@
 {{- if ne (default "" .Values.config.storage.agfs.pathlock.provider) "cache" }}
 {{- fail "replicaCount > 1 requires storage.agfs.pathlock.provider=cache." }}
 {{- end }}
+{{- if eq (default "" .Values.config.storage.agfs.backend) "local" }}
+{{- fail "replicaCount > 1 requires a shared AGFS backend; storage.agfs.backend=local is pod-local." }}
+{{- end }}
+{{- $vectordb := .Values.config.storage.vectordb | default dict }}
+{{- if or (eq (default "" $vectordb.backend) "") (eq (default "" $vectordb.backend) "local") }}
+{{- fail "replicaCount > 1 requires a shared VectorDB backend; storage.vectordb.backend=local is pod-local." }}
+{{- end }}
 {{- $params := default dict $cache.params }}
 {{- $endpoints := default (list) $params.endpoints }}
 {{- if eq (len $endpoints) 0 }}

@@ -441,7 +441,11 @@ class _DeletionProcessor(DequeueHandlerBase):
             return ProcessResult.failed(str(exc))
 
         error = await self._dispatcher.run(lambda: self._deletion_service._process(message))
-        return ProcessResult.success() if error is None else ProcessResult.failed(error)
+        if error is not None:
+            # Leave the durable delivery unacknowledged so another consumer can
+            # retry cleanup after a transient task or storage failure.
+            raise RuntimeError(error)
+        return ProcessResult.success()
 
 
 async def setup_deletion(

@@ -937,7 +937,8 @@ class TaskTracker:
         return deleted
 
     async def wait_for_descendants(
-        self, task_id: str, current_work_id: Optional[str] = None
+        self, task_id: str, current_work_id: Optional[str] = None,
+        *, current_queue_name: Optional[str] = None,
     ) -> None:
         """Wait until work other than the current queue delivery has settled.
 
@@ -945,17 +946,27 @@ class TaskTracker:
         ``TaskWorkIndex`` cannot observe that ACK, so the shared QueueFS snapshot
         is the authority for durable descendants. Direct tasks have no current
         queue delivery, so omit its ID and wait for all their durable work.
-        The local index remains useful
-        for the non-distributed in-memory backend.
+        A queue worker can exclude its parent queue's retry deliveries here;
+        finalization still checks every durable delivery before completing.
+        The local index serves the non-distributed in-memory backend.
         """
 
         async def has_descendants() -> bool:
             if self.distributed_queue_enabled:
-                return await self._queue_manager.has_task_work(
-                    task_id,
-                    exclude_work_ids=frozenset({current_work_id}) if current_work_id else frozenset(),
-                )
-            return self._work_index.has_work(task_id, exclude_work_id=current_work_id)
+                filters = {
+                    "exclude_work_ids": (frozenset({current_work_id})
+                                         if current_work_id else frozenset()),
+                }
+                if current_queue_name:
+                    # Retry deliveries in the parent's queue are siblings,
+                    # not descendants. Finalization still checks every queue.
+                    filters["exclude_queue_names"] = frozenset({current_queue_name})
+                return await self._queue_manager.has_task_work(task_id, **filters)
+            return self._work_index.has_work(
+                task_id, exclude_work_id=current_work_id,
+                exclude_queue_names=(frozenset({current_queue_name})
+                                     if current_queue_name else frozenset()),
+            )
 
         pending = await has_descendants()
         if pending:

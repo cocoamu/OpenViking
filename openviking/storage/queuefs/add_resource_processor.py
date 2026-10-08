@@ -257,7 +257,9 @@ class AddResourceProcessor(DequeueHandlerBase):
                         )
                 else:
                     result = deepcopy(replay_result)
-                await tracker.wait_for_descendants(msg.task_id, metadata.work_id)
+                await tracker.wait_for_descendants(
+                    msg.task_id, metadata.work_id, current_queue_name=self._queue_name
+                )
                 result.setdefault(
                     "queue_status", request_wait_tracker.build_queue_status(telemetry_id)
                 )

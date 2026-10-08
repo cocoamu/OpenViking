@@ -168,12 +168,15 @@ class QueueManager:
         self._task_middleware.attach_task_tracker(tracker)
 
     async def has_task_work(
-        self, task_id: str, *, exclude_work_ids: frozenset[str] = frozenset()
+        self, task_id: str, *, exclude_work_ids: frozenset[str] = frozenset(),
+        exclude_queue_names: frozenset[str] = frozenset(),
     ) -> bool:
         """Check the shared QueueFS source of truth across every named queue."""
         from openviking.service.task_work_index import extract_task_metadata
 
-        for queue in self._queues.values():
+        for name, queue in self._queues.items():
+            if name in exclude_queue_names:
+                continue
             try:
                 messages = await queue.snapshot()
             except (AGFSTimeoutError, AGFSConnectionError, TimeoutError) as exc:

@@ -21,6 +21,21 @@ from openviking.storage.queuefs.queue_middleware import QueueMiddleware
 
 
 @pytest.mark.asyncio
+async def test_descendant_filter_keeps_retry_roots_in_finalization():
+    from types import SimpleNamespace
+    manager = QueueManager(object())
+    root = {"data": {"task_id": "task", "_task_work_id": "retry-root"}}
+    child = {"data": {"task_id": "task", "_task_work_id": "child"}}
+    manager._queues = {
+        "AddResource": SimpleNamespace(snapshot=AsyncMock(return_value=[root])),
+        "Embedding": SimpleNamespace(snapshot=AsyncMock(side_effect=[[child], []])),
+    }
+    assert await manager.has_task_work("task", exclude_queue_names=frozenset({"AddResource"}))
+    assert not await manager.has_task_work("task", exclude_queue_names=frozenset({"AddResource"}))
+    assert await manager.has_task_work("task"), "task cannot finalize until retry roots ACK"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("error", [AGFSTimeoutError, AGFSConnectionError, TimeoutError])
 async def test_shared_work_read_outage_blocks_finalization_until_fresh_read(error):
     manager = QueueManager(object())

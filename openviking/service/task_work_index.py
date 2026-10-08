@@ -269,12 +269,15 @@ class TaskWorkIndex:
         with self._lock:
             self._work.setdefault(metadata.task_id, set()).add((queue_name, metadata.work_id))
 
-    def has_work(self, task_id: str, exclude_work_id: Optional[str] = None) -> bool:
+    def has_work(
+        self, task_id: str, exclude_work_id: Optional[str] = None,
+        *, exclude_queue_names: frozenset[str] = frozenset(),
+    ) -> bool:
         with self._lock:
             if exclude_work_id is not None:
                 return any(
-                    work_id != exclude_work_id
-                    for _queue_name, work_id in self._work.get(task_id, ())
+                    work_id != exclude_work_id and queue_name not in exclude_queue_names
+                    for queue_name, work_id in self._work.get(task_id, ())
                 )
             return bool(self._work.get(task_id) or self._active.get(task_id))
 

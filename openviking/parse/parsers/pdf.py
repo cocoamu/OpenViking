@@ -17,6 +17,7 @@ import base64
 import hashlib
 import io
 import re
+import threading
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -35,6 +36,10 @@ from openviking_cli.utils import get_logger
 from openviking_cli.utils.config.parser_config import PDFConfig
 
 logger = get_logger(__name__)
+
+# PDFium is process-global and cannot be called concurrently, even for different
+# documents. Parsers run in worker threads, so all instances share this mutex.
+_PDF_RENDER_LOCK = threading.Lock()
 
 
 class PDFParser(BaseParser):
@@ -670,11 +675,11 @@ class PDFParser(BaseParser):
                 return None
 
             cropped = page.crop(bbox)
-            page_image = cropped.to_image(resolution=self.config.image_resolution)
-
-            buffer = io.BytesIO()
-            page_image.save(buffer, format="PNG")
-            return buffer.getvalue()
+            with _PDF_RENDER_LOCK:
+                page_image = cropped.to_image(resolution=self.config.image_resolution)
+                buffer = io.BytesIO()
+                page_image.save(buffer, format="PNG")
+                return buffer.getvalue()
 
         except Exception as e:
             logger.debug(f"Image extraction error: {e}")

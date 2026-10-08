@@ -53,7 +53,10 @@ async def main(mode):
         }
     )
     cache_config = CacheConfig(
-        provider="redis", params={"mode": "standalone", "endpoints": [endpoint]}
+        provider="redis", params={
+            "mode": "standalone", "endpoints": [endpoint],
+            "connect_timeout_ms": 1000, "command_timeout_ms": 1000,
+        }
     )
     binding = RagfsBindingConfig(agfs=agfs_config, cache=cache_config)
     client_type, _ = get_binding_client()
@@ -85,6 +88,15 @@ async def main(mode):
             # intentionally terminates this process without touching the queue.
             print(f"{mode}: claimed message {message['id']} and exiting without ack")
             return
+    elif mode == "wait":
+        # Retain this process's stale local index while a separate worker ACKs.
+        index.rebuild({"AddResource": await queue.snapshot()})
+        assert index.has_work(TASK_ID)
+        print("wait: ready for remote ACK", flush=True)
+        await asyncio.wait_for(tracker.wait_for_descendants(TASK_ID, "parent-work"), 30)
+        assert index.has_work(TASK_ID), "probe must exercise the stale-index defect"
+        assert not await queue.snapshot()
+        assert (await tracker.get(TASK_ID, account_id=ACCOUNT, user_id=USER)).status == TaskStatus.COMPLETED
     elif mode == "consume":
         index.rebuild({"AddResource": await queue.snapshot()})
         message = await queue.dequeue_raw()

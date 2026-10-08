@@ -774,7 +774,7 @@ class TestAddResourceArgs:
             "failed",
             "parse failed; write failed",
         ),
-        (None, asyncio.CancelledError(), "cancelled", None),
+        (None, asyncio.CancelledError(), None, None),
     ],
 )
 async def test_add_resource_processor_records_paused_watch_result(
@@ -792,6 +792,7 @@ async def test_add_resource_processor_records_paused_watch_result(
         fail=AsyncMock(),
         get_task_auth=AsyncMock(return_value={}),
         wait_for_descendants=AsyncMock(),
+        is_cancellation_requested=Mock(return_value=False),
     )
     monkeypatch.setattr(
         "openviking.storage.queuefs.add_resource_processor.get_task_tracker",
@@ -832,6 +833,9 @@ async def test_add_resource_processor_records_paused_watch_result(
     else:
         await processor._process(message, data)
 
+    if expected_status is None:
+        service.record_watch_execution.assert_not_awaited()
+        return
     service.record_watch_execution.assert_awaited_once_with(
         "watch-1",
         status=expected_status,

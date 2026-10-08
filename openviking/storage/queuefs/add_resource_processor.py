@@ -297,8 +297,11 @@ class AddResourceProcessor(DequeueHandlerBase):
                 terminal = True
                 return ProcessResult.success()
             except asyncio.CancelledError:
-                await self._record_watch_execution(msg, "cancelled")
-                terminal = True
+                # Worker shutdown leaves the delivery unacknowledged for another
+                # Pod. Only an explicit task cancellation may discard its source.
+                if tracker.is_cancellation_requested(msg.task_id):
+                    await self._record_watch_execution(msg, "cancelled")
+                    terminal = True
                 raise
             except Exception as exc:
                 await self._record_watch_execution(

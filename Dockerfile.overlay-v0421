@@ -1,6 +1,10 @@
 FROM openviking-cn-beijing.cr.volces.com/volcengine/openviking:v0.4.21
 
+COPY openviking_cli/utils/config/embedding_config.py /app/.venv/lib/python3.13/site-packages/openviking_cli/utils/config/embedding_config.py
 COPY openviking_cli/utils/config/storage_config.py /app/.venv/lib/python3.13/site-packages/openviking_cli/utils/config/storage_config.py
+COPY openviking/models/embedder/base.py /app/.venv/lib/python3.13/site-packages/openviking/models/embedder/base.py
+COPY openviking/models/embedder/volcengine_embedders.py /app/.venv/lib/python3.13/site-packages/openviking/models/embedder/volcengine_embedders.py
+COPY openviking/server/routers/system.py /app/.venv/lib/python3.13/site-packages/openviking/server/routers/system.py
 COPY openviking/service/core.py /app/.venv/lib/python3.13/site-packages/openviking/service/core.py
 COPY openviking/service/deletion.py /app/.venv/lib/python3.13/site-packages/openviking/service/deletion.py
 COPY openviking/service/reindex_executor.py /app/.venv/lib/python3.13/site-packages/openviking/service/reindex_executor.py
@@ -8,5 +12,9 @@ COPY openviking/service/task_queue_middleware.py /app/.venv/lib/python3.13/site-
 COPY openviking/service/task_store.py /app/.venv/lib/python3.13/site-packages/openviking/service/task_store.py
 COPY openviking/service/task_tracker.py /app/.venv/lib/python3.13/site-packages/openviking/service/task_tracker.py
 COPY openviking/service/task_work_index.py /app/.venv/lib/python3.13/site-packages/openviking/service/task_work_index.py
+COPY openviking/storage/abstract_overview.py /app/.venv/lib/python3.13/site-packages/openviking/storage/abstract_overview.py
+COPY openviking/storage/queuefs/add_resource_processor.py /app/.venv/lib/python3.13/site-packages/openviking/storage/queuefs/add_resource_processor.py
 COPY openviking/storage/queuefs/queue_manager.py /app/.venv/lib/python3.13/site-packages/openviking/storage/queuefs/queue_manager.py
+COPY openviking/storage/queuefs/semantic_dag.py /app/.venv/lib/python3.13/site-packages/openviking/storage/queuefs/semantic_dag.py
 COPY openviking/storage/viking_fs/_snapshot.py /app/.venv/lib/python3.13/site-packages/openviking/storage/viking_fs/_snapshot.py
+COPY openviking/utils/model_retry.py /app/.venv/lib/python3.13/site-packages/openviking/utils/model_retry.py

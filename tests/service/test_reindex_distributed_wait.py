@@ -32,7 +32,7 @@ async def test_reindex_waits_for_remote_ack_with_stale_local_roots(monkeypatch, 
     entered_wait = asyncio.Event()
     async def shared_wait(task_id, current_work_id):
         assert task_id == "reindex-task"
-        assert current_work_id == ""
+        assert current_work_id is None
         entered_wait.set()
         await remote_ack.wait()
     task_tracker = SimpleNamespace(distributed_queue_enabled=distributed,

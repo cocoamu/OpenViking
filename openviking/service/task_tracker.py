@@ -936,12 +936,16 @@ class TaskTracker:
                 deleted += 1
         return deleted
 
-    async def wait_for_descendants(self, task_id: str, current_work_id: str) -> None:
+    async def wait_for_descendants(
+        self, task_id: str, current_work_id: Optional[str] = None
+    ) -> None:
         """Wait until work other than the current queue delivery has settled.
 
         In distributed mode, another Pod can ACK a child delivery. Its local
         ``TaskWorkIndex`` cannot observe that ACK, so the shared QueueFS snapshot
-        is the authority for durable descendants. The local index remains useful
+        is the authority for durable descendants. Direct tasks have no current
+        queue delivery, so omit its ID and wait for all their durable work.
+        The local index remains useful
         for the non-distributed in-memory backend.
         """
 
@@ -949,7 +953,7 @@ class TaskTracker:
             if self.distributed_queue_enabled:
                 return await self._queue_manager.has_task_work(
                     task_id,
-                    exclude_work_ids=frozenset({current_work_id}),
+                    exclude_work_ids=frozenset({current_work_id}) if current_work_id else frozenset(),
                 )
             return self._work_index.has_work(task_id, exclude_work_id=current_work_id)
 

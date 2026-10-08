@@ -572,7 +572,7 @@ class ReindexExecutor:
                     # QueueFS, whose ACK state is shared across all replicas.
                     # Child failures remain on the shared task record and are
                     # preserved when _run_tracked records its result.
-                    await task_tracker.wait_for_descendants(task_context.task_id, "")
+                    await task_tracker.wait_for_descendants(task_context.task_id, None)
                 else:
                     await wait_tracker.wait_for_request(telemetry_id)
                 self._apply_embedding_wait_status(

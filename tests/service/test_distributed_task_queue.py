@@ -198,7 +198,8 @@ async def test_remote_cancel_waits_for_direct_work_on_another_pod():
     assert (await b.get(task.task_id, **OWNER)).status == TaskStatus.CANCELLED
 
 
-async def test_distributed_wait_limits_shared_scans_and_observes_remote_ack():
+@pytest.mark.parametrize("current_work_id", ["parent-work", None])
+async def test_distributed_wait_limits_shared_scans_and_observes_remote_ack(current_work_id):
     shared, ((a, producer, index), (_, consumer, _)) = two_pods()
     task = await a.create("add_resource", **OWNER)
     message = await shared.enqueue(producer, task.task_id)
@@ -211,9 +212,14 @@ async def test_distributed_wait_limits_shared_scans_and_observes_remote_ack():
         return await original(*args, **kwargs)
 
     shared.has_task_work = count_scan
-    waiting = asyncio.create_task(a.wait_for_descendants(task.task_id, "parent-work"))
+    waiting = asyncio.create_task(a.wait_for_descendants(task.task_id, current_work_id))
     try:
         await asyncio.sleep(0.25)
+        assert not waiting.done(), "direct reindex must record its wait without a queue delivery ID"
+        recorded = await a.get(task.task_id, **OWNER)
+        event = recorded.execution_events["items"][-1]
+        assert event["kind"] == "waiting_for_descendants"
+        assert event.get("operation") == current_work_id
         assert calls <= 2, "one waiting task must not repeatedly scan all queues in a quarter second"
         await shared.ack(consumer, message)
         await asyncio.wait_for(waiting, 2)

@@ -28,7 +28,7 @@ from openviking.core.namespace import (
 from openviking.server.dependencies import get_service
 from openviking.server.identity import RequestContext
 from openviking.service.task_tracker import get_task_tracker
-from openviking.service.task_work_index import bind_task_context
+from openviking.service.task_work_index import bind_task_context, get_task_context
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 from openviking.storage.abstract_overview import body_for_preview, embedding_text_for_body
 from openviking.storage.errors import ResourceBusyError
@@ -564,7 +564,17 @@ class ReindexExecutor:
                 )
 
             if telemetry_id and mode != "prune_orphans":
-                await wait_tracker.wait_for_request(telemetry_id)
+                task_context = get_task_context()
+                task_tracker = get_task_tracker()
+                if task_context is not None and task_tracker.distributed_queue_enabled:
+                    # Remote consumers cannot update this process's request
+                    # tracker. Tracked reindex work carries the task ID in
+                    # QueueFS, whose ACK state is shared across all replicas.
+                    # Child failures remain on the shared task record and are
+                    # preserved when _run_tracked records its result.
+                    await task_tracker.wait_for_descendants(task_context.task_id, "")
+                else:
+                    await wait_tracker.wait_for_request(telemetry_id)
                 self._apply_embedding_wait_status(
                     counters,
                     wait_tracker.build_queue_status(telemetry_id),

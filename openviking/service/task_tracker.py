@@ -953,7 +953,8 @@ class TaskTracker:
                 )
             return self._work_index.has_work(task_id, exclude_work_id=current_work_id)
 
-        if await has_descendants():
+        pending = await has_descendants()
+        if pending:
             task = self._cached_task(task_id)
             if task and task.account_id and task.user_id:
                 await self.record_event(
@@ -963,8 +964,14 @@ class TaskTracker:
                     account_id=task.account_id,
                     user_id=task.user_id,
                 )
-        while await has_descendants():
-            await asyncio.sleep(0.05)
+        # A shared read scans durable queues over Redis; a 50 ms loop multiplies
+        # that traffic across every active parent and Pod. Local mode remains
+        # inexpensive, while distributed completion observes a fresh read once
+        # per second without caching absence of newly enqueued work.
+        poll_interval = 1.0 if self.distributed_queue_enabled else 0.05
+        while pending:
+            await asyncio.sleep(poll_interval)
+            pending = await has_descendants()
 
     async def record_event(
         self,

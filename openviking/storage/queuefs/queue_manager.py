@@ -13,6 +13,7 @@ import traceback
 from typing import Any, Dict, Optional, Sequence, Set, Union
 
 from openviking.service.task_work_index import TaskWorkIndex
+from openviking.pyagfs.exceptions import AGFSConnectionError, AGFSTimeoutError
 from openviking_cli.utils.logger import get_logger
 
 from .embedding_queue import EmbeddingQueue
@@ -173,7 +174,15 @@ class QueueManager:
         from openviking.service.task_work_index import extract_task_metadata
 
         for queue in self._queues.values():
-            for message in await queue.snapshot():
+            try:
+                messages = await queue.snapshot()
+            except (AGFSTimeoutError, AGFSConnectionError, TimeoutError) as exc:
+                # An unavailable observation cannot prove that durable work has
+                # drained. Keep the task pending and let the next fresh read
+                # settle it instead of failing an otherwise successful ingest.
+                logger.warning("Shared task work observation unavailable: %s", type(exc).__name__)
+                return True
+            for message in messages:
                 metadata = extract_task_metadata(message)
                 if (
                     metadata is not None

@@ -12,11 +12,34 @@ from unittest.mock import AsyncMock
 import pytest
 
 from openviking.pyagfs import AsyncAGFSClient
+from openviking.pyagfs.exceptions import AGFSConnectionError, AGFSTimeoutError
 from openviking.service.task_work_index import bind_task_context
 from openviking.storage.queuefs.named_queue import DequeueHandlerBase, NamedQueue
 from openviking.storage.queuefs.process_result import ProcessResult
 from openviking.storage.queuefs.queue_manager import QueueManager
 from openviking.storage.queuefs.queue_middleware import QueueMiddleware
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [AGFSTimeoutError, AGFSConnectionError, TimeoutError])
+async def test_shared_work_read_outage_blocks_finalization_until_fresh_read(error):
+    manager = QueueManager(object())
+    snapshot = AsyncMock(side_effect=[error("temporary transport outage"), []])
+    from types import SimpleNamespace
+
+    manager._queues = {"AddResource": SimpleNamespace(snapshot=snapshot)}
+    assert await manager.has_task_work("task") is True
+    assert await manager.has_task_work("task") is False
+
+
+@pytest.mark.asyncio
+async def test_shared_work_permission_failure_is_not_hidden():
+    manager = QueueManager(object())
+    from types import SimpleNamespace
+
+    manager._queues = {"AddResource": SimpleNamespace(snapshot=AsyncMock(side_effect=PermissionError))}
+    with pytest.raises(PermissionError):
+        await manager.has_task_work("task")
 
 
 def test_queuefs_package_imports_in_a_clean_process(tmp_path) -> None:

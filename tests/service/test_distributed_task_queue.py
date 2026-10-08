@@ -196,3 +196,28 @@ async def test_remote_cancel_waits_for_direct_work_on_another_pod():
     assert (await b.get(task.task_id, **OWNER)).status == TaskStatus.CANCELLING
     await a.unregister_running_task_shared(task.task_id, worker_id=worker_id, **OWNER)
     assert (await b.get(task.task_id, **OWNER)).status == TaskStatus.CANCELLED
+
+
+async def test_distributed_wait_limits_shared_scans_and_observes_remote_ack():
+    shared, ((a, producer, index), (_, consumer, _)) = two_pods()
+    task = await a.create("add_resource", **OWNER)
+    message = await shared.enqueue(producer, task.task_id)
+    calls = 0
+    original = shared.has_task_work
+
+    async def count_scan(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return await original(*args, **kwargs)
+
+    shared.has_task_work = count_scan
+    waiting = asyncio.create_task(a.wait_for_descendants(task.task_id, "parent-work"))
+    try:
+        await asyncio.sleep(0.25)
+        assert calls <= 2, "one waiting task must not repeatedly scan all queues in a quarter second"
+        await shared.ack(consumer, message)
+        await asyncio.wait_for(waiting, 2)
+        assert index.has_work(task.task_id), "remote ACK deliberately leaves this local index stale"
+    finally:
+        waiting.cancel()
+        await asyncio.gather(waiting, return_exceptions=True)

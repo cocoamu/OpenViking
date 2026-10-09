@@ -421,6 +421,11 @@ class PDFParser(BaseParser):
     @staticmethod
     def _release_page_cache(page: Any) -> None:
         """Release pdfplumber/pdfminer per-page caches when available."""
+        rendered = getattr(page, "_openviking_rendered_page", None)
+        if rendered is not None:
+            delattr(page, "_openviking_rendered_page")
+            for image in (rendered.original, rendered.annotated):
+                image.close()
         close = getattr(page, "close", None)
         if callable(close):
             try:
@@ -676,7 +681,21 @@ class PDFParser(BaseParser):
 
             cropped = page.crop(bbox)
             with _PDF_RENDER_LOCK:
-                page_image = cropped.to_image(resolution=self.config.image_resolution)
+                # Rendering a crop still rasterizes the entire PDF page. Reuse
+                # that raster for all images on an ordinary, uncropped page.
+                # Non-standard crop boxes retain pdfplumber's original path.
+                if getattr(page, "is_original", False) and page.bbox == page.cropbox:
+                    from pdfplumber.display import PageImage
+
+                    rendered = getattr(page, "_openviking_rendered_page", None)
+                    if rendered is None:
+                        rendered = page.to_image(resolution=self.config.image_resolution)
+                        page._openviking_rendered_page = rendered
+                    page_image = PageImage(
+                        cropped, original=rendered.original, resolution=rendered.resolution
+                    )
+                else:
+                    page_image = cropped.to_image(resolution=self.config.image_resolution)
                 buffer = io.BytesIO()
                 page_image.save(buffer, format="PNG")
                 return buffer.getvalue()

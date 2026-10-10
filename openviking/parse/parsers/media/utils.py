@@ -251,6 +251,7 @@ async def generate_image_summary(
     original_filename: str,
     llm_sem: Optional[asyncio.Semaphore] = None,
     ctx: Optional["RequestContext"] = None,
+    image_context: str = "",
 ) -> Dict[str, Any]:
     """
     Generate summary for an image file using VLM.
@@ -260,6 +261,7 @@ async def generate_image_summary(
         original_filename: Original filename of the image
         llm_sem: Semaphore to limit concurrent LLM calls
         ctx: Optional request context for tenant-aware file access
+        image_context: Verified native PDF page reference from this semantic task
 
     Returns:
         Dictionary with "name" and "summary" keys
@@ -282,6 +284,14 @@ async def generate_image_summary(
                 f"[MediaUtils.generate_image_summary] SVG format detected, skipping VLM analysis: {image_uri}"
             )
             return {"name": file_name, "summary": "SVG image (format not supported by VLM)"}
+
+        if image_context and getattr(
+            getattr(config, "image", None), "reuse_pdf_page_text_for_summary", False
+        ):
+            # The DAG supplies this only for a referenced native PDF crop and a
+            # multimodal embedder. Keep the image itself for visual retrieval;
+            # the text is explicitly source-page evidence, never image OCR.
+            return {"name": file_name, "summary": image_context}
 
         logger.info(
             f"[MediaUtils.generate_image_summary] Generating summary for image: {image_uri}"

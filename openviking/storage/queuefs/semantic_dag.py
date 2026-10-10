@@ -11,6 +11,10 @@ from typing import Any, ClassVar, Dict, List, Optional, Set
 from weakref import WeakKeyDictionary
 
 from openviking.parse.parsers.media import get_media_type
+from openviking.parse.parsers.media.pdf_image_context import (
+    PDF_IMAGE_NAME,
+    PdfImageContextCache,
+)
 from openviking.server.identity import RequestContext
 from openviking.service.task_work_index import bind_task_context, get_task_context
 from openviking.storage.abstract_overview import (
@@ -797,8 +801,28 @@ class SemanticDagExecutor:
             else:
                 self._file_change_status[file_path] = True
             if summary_dict is None:
+                summary_kwargs = {}
+                config = get_openviking_config()
+                if PDF_IMAGE_NAME.fullmatch(file_name) and getattr(
+                    getattr(config, "image", None), "reuse_pdf_page_text_for_summary", False
+                ):
+                    if not hasattr(self, "_pdf_page_context_cache"):
+                        self._pdf_page_context_cache = PdfImageContextCache()
+                        try:
+                            self._pdf_page_context_multimodal = bool(
+                                config.embedding.get_embedder().supports_multimodal
+                            )
+                        except Exception:
+                            self._pdf_page_context_multimodal = False
+                    node = self._nodes.get(parent_uri)
+                    if self._pdf_page_context_multimodal and node is not None:
+                        context = await self._pdf_page_context_cache.get(
+                            parent_uri, file_name, node.file_paths, self._viking_fs, self._ctx
+                        )
+                        if context:
+                            summary_kwargs["image_context"] = context
                 summary_dict = await self._processor._generate_single_file_summary(
-                    file_path, llm_sem=self._llm_sem, ctx=self._ctx
+                    file_path, llm_sem=self._llm_sem, ctx=self._ctx, **summary_kwargs
                 )
         except Exception as e:
             logger.warning(f"Failed to generate summary for {file_path}: {e}")

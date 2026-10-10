@@ -1035,6 +1035,7 @@ class SemanticProcessor(DequeueHandlerBase):
         file_path: str,
         llm_sem: Optional[asyncio.Semaphore] = None,
         ctx: Optional[RequestContext] = None,
+        image_context: str = "",
     ) -> Dict[str, Any]:
         """Generate summary for a single file.
 
@@ -1059,6 +1060,10 @@ class SemanticProcessor(DequeueHandlerBase):
                 prefix = None
             media_type = get_media_type(file_name, None, content=prefix)
         if media_type == "image":
+            if image_context:
+                return await generate_image_summary(
+                    file_path, file_name, llm_sem, ctx=ctx, image_context=image_context
+                )
             return await generate_image_summary(file_path, file_name, llm_sem, ctx=ctx)
         elif media_type == "audio":
             return await generate_audio_summary(file_path, file_name, llm_sem, ctx=ctx)

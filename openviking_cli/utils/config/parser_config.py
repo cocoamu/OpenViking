@@ -336,6 +336,8 @@ class ImageConfig(ParserConfig):
     max_tile_dimension_px: int = 2048  # 2048 pixels
     tile_overlap_px: int = 2  # 2 pixels
     large_image_threshold_dimension: int = 4096  # 4096 pixels
+    # Opt-in for native PDF crops only; original image vectors are retained.
+    reuse_pdf_page_text_for_summary: bool = False
 
     def validate(self) -> None:
         """

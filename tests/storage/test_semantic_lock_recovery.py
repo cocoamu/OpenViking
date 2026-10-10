@@ -29,7 +29,7 @@ class SemanticHandoffRecoveryTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(sys.modules, {**modules, spec.name: module}):
             spec.loader.exec_module(module)
         self.scope = module.SemanticLockScope
-        self.coverage = [{'path': '/tenant/resource', 'kind': 'tree'}, {'path': '/tenant/exact', 'kind': 'path'}]
+        self.coverage = [{'path': '/tenant/resource', 'kind': 'tree'}, {'path': '/tenant/exact', 'kind': 'exact'}]
         self.handoff = {'owner_id': 'old-owner', 'covered_paths': self.coverage}
         self.fresh = {'owner_id': 'fresh-owner'}
         self.agfs.pathlock_acquire_batch.return_value = self.fresh
@@ -100,4 +100,3 @@ class SemanticHandoffRecoveryTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             await self.scope.resolve(self.handoff, caller_lock=self.fresh)
         self.agfs.pathlock_adopt.assert_not_awaited()
-

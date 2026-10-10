@@ -104,6 +104,21 @@ class MemoryAdmissionTests(unittest.TestCase):
         with patch.object(worker.sys,"platform","darwin"):
             self.assertFalse(worker.should_isolate(Path("original.pdf")))
 
+    def test_small_compressed_documents_are_isolated_before_decoding(self):
+        suffixes = (".pdf", ".PDF", ".doc", ".docx", ".docm", ".odt", ".rtf",
+                    ".ppt", ".pptx", ".pptm", ".pps", ".ppsx", ".ppsm", ".pot", ".odp",
+                    ".xls", ".xlsx", ".xlsm", ".xlsb", ".ods", ".epub")
+        with patch.object(worker.sys, "platform", "linux"), \
+             patch.object(Path, "stat", return_value=SimpleNamespace(st_size=1024)):
+            for suffix in suffixes:
+                with self.subTest(suffix=suffix):
+                    self.assertTrue(worker.should_isolate(Path("compressed" + suffix)))
+            self.assertFalse(worker.should_isolate(Path("plain.csv")))
+            self.assertFalse(worker.should_isolate(Path("plain.txt")))
+        with patch.object(worker.sys, "platform", "linux"), \
+             patch.object(Path, "stat", side_effect=FileNotFoundError):
+            self.assertFalse(worker.should_isolate(Path("missing.pdf")))
+
     def test_invalid_budgets_fail_explicitly(self):
         with patch.dict(os.environ,{"OPENVIKING_DOCUMENT_WORKER_MEMORY_MB":"0"}):
             with self.assertRaises(ValueError):

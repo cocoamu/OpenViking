@@ -57,16 +57,25 @@ class WorkerSettings:
 
 
 def should_isolate(path: Path) -> bool:
-    """Keep small files and non-Linux callers on the existing conversion path."""
+    """Bound native document decoding even when its compressed input is small."""
     if sys.platform != "linux" or os.getenv("OPENVIKING_DOCUMENT_ISOLATION", "1") == "0":
         return False
     threshold = int(os.getenv("OPENVIKING_DOCUMENT_WORKER_THRESHOLD_MB", "4")) * _MIB
     if threshold <= 0:
         raise ValueError("Document worker threshold must be positive")
     try:
-        return path.stat().st_size >= threshold
+        size = path.stat().st_size
     except OSError:
         return False
+    # Compressed byte size cannot bound decoded pages, XML, or native image buffers.
+    # Keep plain small inputs on their existing path, but never let a small native
+    # document bypass the process-global slot and child address/RSS limits.
+    native_suffixes = {
+        ".pdf", ".doc", ".docx", ".docm", ".odt", ".rtf",
+        ".ppt", ".pptx", ".pptm", ".pps", ".ppsx", ".ppsm", ".pot", ".odp",
+        ".xls", ".xlsx", ".xlsm", ".xlsb", ".ods", ".epub",
+    }
+    return path.suffix.lower() in native_suffixes or size >= threshold
 
 
 def _memory_snapshot() -> tuple[int, int] | None:

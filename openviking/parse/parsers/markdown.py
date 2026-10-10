@@ -1434,16 +1434,16 @@ class MarkdownParser(BaseParser):
                 )
 
         # Add real sections (top-level only for this pass)
-        min_level = min(h[3] for h in headings)
         i = 0
         while i < len(headings):
-            if headings[i][3] == min_level:
-                sections.append(
-                    {
-                        "heading_idx": i,
-                    }
-                )
+            # A document can start at ### and later introduce ##. Select roots
+            # in source order, skipping only descendants of each selected root;
+            # filtering by the document-wide minimum level drops that prefix.
+            sections.append({"heading_idx": i})
+            level = headings[i][3]
             i += 1
+            while i < len(headings) and headings[i][3] > level:
+                i += 1
 
         # Process sections with merge logic
         await self._process_sections_with_merge(
@@ -1583,6 +1583,27 @@ class MarkdownParser(BaseParser):
 
         return merged
 
+    @staticmethod
+    def _unique_output_name(
+        ops: List[_LayoutOp], parent_dir: str, name: str, suffixes: List[str]
+    ) -> str:
+        """Keep every section when headings or generated filenames repeat.
+
+        Reservations come from this layout's operations, rather than parser
+        instance state, so concurrent documents remain independent. Check all
+        parts of a split output before selecting its basename.
+        """
+        occupied = {op.uri for op in ops}
+        candidate = name
+        index = 0
+        while True:
+            stem = f"{parent_dir}/{candidate}"
+            targets = {stem, f"{stem}.md", *(f"{stem}{suffix}" for suffix in suffixes)}
+            if occupied.isdisjoint(targets):
+                return candidate
+            index += 1
+            candidate = f"{name}_{index}"
+
     async def _save_section(
         self,
         ops: List[_LayoutOp],
@@ -1596,6 +1617,7 @@ class MarkdownParser(BaseParser):
         """Plan a single section (file or directory) into ``ops``."""
         name, tokens, content_text = section["name"], section["tokens"], section["content"]
         has_children = section["has_children"]
+        name = self._unique_output_name(ops, parent_dir, name, [".md"])
 
         # Fits in one file (check both token and char limits)
         if tokens <= max_size and len(content_text) <= self.config.max_section_chars:
@@ -1704,9 +1726,13 @@ class MarkdownParser(BaseParser):
         if len(content) > max_chars:
             max_size = self.config.max_section_size or self.DEFAULT_MAX_SECTION_SIZE
             parts = self._smart_split_content(content, max_size)
+            name = self._unique_output_name(
+                ops, parent_dir, name, [f"_{i}.md" for i in range(1, len(parts) + 1)]
+            )
             for i, part in enumerate(parts, 1):
                 ops.append(_LayoutOp("write", f"{parent_dir}/{name}_{i}.md", part))
         else:
+            name = self._unique_output_name(ops, parent_dir, name, [".md"])
             ops.append(_LayoutOp("write", f"{parent_dir}/{name}.md", content))
 
     def _get_section_info(

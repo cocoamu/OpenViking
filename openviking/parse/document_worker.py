@@ -30,6 +30,7 @@ class DocumentWorkerError(RuntimeError):
 @dataclass(frozen=True)
 class WorkerSettings:
     memory_bytes: int = 3072 * _MIB
+    resident_bytes: int = 1024 * _MIB
     max_workers: int = 1
     timeout_seconds: float = 600
     admission_timeout_seconds: float = 900
@@ -38,13 +39,14 @@ class WorkerSettings:
     def from_environment(cls) -> "WorkerSettings":
         settings = cls(
             memory_bytes=int(os.getenv("OPENVIKING_DOCUMENT_WORKER_MEMORY_MB", "3072")) * _MIB,
+            resident_bytes=int(os.getenv("OPENVIKING_DOCUMENT_WORKER_RESIDENT_MB", "1024")) * _MIB,
             max_workers=int(os.getenv("OPENVIKING_DOCUMENT_WORKER_CONCURRENCY", "1")),
             timeout_seconds=float(os.getenv("OPENVIKING_DOCUMENT_WORKER_TIMEOUT", "600")),
             admission_timeout_seconds=float(
                 os.getenv("OPENVIKING_DOCUMENT_WORKER_ADMISSION_TIMEOUT", "900")
             ),
         )
-        budgets = (settings.memory_bytes, settings.max_workers,
+        budgets = (settings.memory_bytes, settings.resident_bytes, settings.max_workers,
                    settings.timeout_seconds, settings.admission_timeout_seconds)
         if any(not math.isfinite(value) or value <= 0 for value in budgets):
             raise ValueError("Document worker budgets must be positive")
@@ -90,7 +92,9 @@ def _try_acquire(settings: WorkerSettings) -> bool:
             used, capacity = snapshot
             # Account for reservations not yet resident. Already-running workers
             # may consume their entire allowance after this snapshot is taken.
-            reserved = (_ACTIVE_WORKERS + 1) * settings.memory_bytes
+            # RLIMIT_AS includes mapped native libraries, not just physical RAM.
+            # Reserve RSS separately, and supervise it while the child runs.
+            reserved = (_ACTIVE_WORKERS + 1) * min(settings.resident_bytes, settings.memory_bytes)
             if used + reserved > int(capacity * 0.85):
                 return False
         _ACTIVE_WORKERS += 1
@@ -144,6 +148,40 @@ async def _stop_worker(process: asyncio.subprocess.Process) -> None:
         await process.wait()
 
 
+def _worker_resident_bytes(pid: int) -> int | None:
+    try:
+        for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+async def _wait_worker(process: asyncio.subprocess.Process, settings: WorkerSettings) -> None:
+    waiting = asyncio.create_task(process.wait())
+    deadline = time.monotonic() + settings.timeout_seconds
+    try:
+        while not waiting.done():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            try:
+                await asyncio.wait_for(asyncio.shield(waiting), min(0.1, remaining))
+            except asyncio.TimeoutError:
+                resident = _worker_resident_bytes(process.pid)
+                snapshot = _memory_snapshot()
+                if (resident is not None and resident > settings.resident_bytes) or (
+                    snapshot is not None and snapshot[0] > int(snapshot[1] * 0.85)
+                ):
+                    raise DocumentWorkerError("DOCUMENT_WORKER_MEMORY_LIMIT: physical memory budget exceeded")
+        await waiting
+    finally:
+        if not waiting.done():
+            waiting.cancel()
+        await asyncio.gather(waiting, return_exceptions=True)
+
+
 async def convert_document_in_worker(
     kind: str,
     path: Path,
@@ -192,7 +230,7 @@ async def convert_document_in_worker(
                     process = await _finish_cleanup(spawn)
                     raise
                 try:
-                    await asyncio.wait_for(process.wait(), settings.timeout_seconds)
+                    await _wait_worker(process, settings)
                 except asyncio.TimeoutError as exc:
                     raise DocumentWorkerError("DOCUMENT_WORKER_TIMEOUT: local conversion exceeded budget") from exc
                 if not result_file.is_file():

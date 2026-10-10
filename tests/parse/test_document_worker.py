@@ -32,6 +32,9 @@ if mode=='ignore':signal.signal(signal.SIGTERM,signal.SIG_IGN)
 Path(r['media_dir'],'started').write_text(str(os.getpid()))
 if mode in ['sleep','ignore']:
  time.sleep(30)
+if mode=='resident':
+ x=bytearray(80*1024*1024)
+ time.sleep(30)
 if mode=='exit':os._exit(23)
 if mode=='bad':out.write_text('{"status":"ok","result":{"markdown":23}}');sys.exit(0)
 if mode=='memory':
@@ -71,6 +74,14 @@ class MemoryAdmissionTests(unittest.TestCase):
         self.assertEqual(results.count(True), 1)
         self.assertEqual(worker._ACTIVE_WORKERS, 1)
 
+    def test_four_gib_container_reserves_physical_not_virtual_memory(self):
+        settings = worker.WorkerSettings()
+        with patch.object(worker, "_memory_snapshot", return_value=(1400*worker._MIB, 4096*worker._MIB)):
+            self.assertTrue(worker._try_acquire(settings))
+        worker._ACTIVE_WORKERS = 0
+        with patch.object(worker, "_memory_snapshot", return_value=(2600*worker._MIB, 4096*worker._MIB)):
+            self.assertFalse(worker._try_acquire(settings))
+
     def test_cgroup_v2_and_v1_formats(self):
         for values, expected in [
             ({"/sys/fs/cgroup/memory.current":"45", "/sys/fs/cgroup/memory.max":"100"},(45,100)),
@@ -95,6 +106,9 @@ class MemoryAdmissionTests(unittest.TestCase):
 
     def test_invalid_budgets_fail_explicitly(self):
         with patch.dict(os.environ,{"OPENVIKING_DOCUMENT_WORKER_MEMORY_MB":"0"}):
+            with self.assertRaises(ValueError):
+                worker.WorkerSettings.from_environment()
+        with patch.dict(os.environ,{"OPENVIKING_DOCUMENT_WORKER_RESIDENT_MB":"0"}):
             with self.assertRaises(ValueError):
                 worker.WorkerSettings.from_environment()
         for value in ("nan", "inf"):
@@ -168,6 +182,24 @@ class WorkerLifecycleTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(worker.DocumentWorkerError,"WORKER_TIMEOUT"):
                 await self.run_worker("sleep")
         self.assert_reaped(await self.started())
+
+    async def test_container_pressure_stops_child_and_next_file_can_run(self):
+        task = asyncio.create_task(self.run_worker("sleep"))
+        pid = await self.started()
+        with patch.object(worker, "_memory_snapshot", return_value=(90,100)):
+            with self.assertRaisesRegex(worker.DocumentWorkerError,"WORKER_MEMORY_LIMIT"):
+                await task
+        self.assert_reaped(pid)
+        self.assertEqual((await self.run_worker())["markdown"],"same document")
+
+    @unittest.skipUnless(sys.platform=="linux","Linux resident memory accounting")
+    async def test_real_resident_limit_stops_and_reaps_only_worker(self):
+        settings = worker.WorkerSettings(resident_bytes=32*worker._MIB)
+        with patch.object(worker.WorkerSettings,"from_environment",return_value=settings):
+            with self.assertRaisesRegex(worker.DocumentWorkerError,"WORKER_MEMORY_LIMIT"):
+                await self.run_worker("resident")
+        self.assert_reaped(await self.started())
+        self.assertEqual((await self.run_worker())["markdown"],"same document")
 
     async def test_cancel_reaps_child_before_releasing_admission(self):
         task=asyncio.create_task(self.run_worker("sleep"));pid=await self.started()

@@ -36,6 +36,14 @@ if mode=='resident':
  x=bytearray(80*1024*1024)
  time.sleep(30)
 if mode=='exit':os._exit(23)
+if mode=='burst':
+ import resource
+ resource.setrlimit(resource.RLIMIT_AS,(r['memory_bytes'],r['memory_bytes']))
+ try:
+  allocated=bytearray(128*1024*1024)
+  blocked=False
+ except MemoryError:blocked=True
+ out.write_text(json.dumps({'status':'ok','result':{'markdown':'bounded document','meta':{'allocationBlockedBeforeRSSGrowth':blocked}},'stats':{'peak_rss_kib':resource.getrusage(resource.RUSAGE_SELF).ru_maxrss}}));sys.exit(0)
 if mode=='bad':out.write_text('{"status":"ok","result":{"markdown":23}}');sys.exit(0)
 if mode=='memory':
  import resource
@@ -266,6 +274,16 @@ class WorkerLifecycleTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(worker.DocumentWorkerError,"MemoryError"):
             await self.run_worker("memory")
         self.assertEqual((await self.run_worker())["markdown"],"same document")
+
+    @unittest.skipUnless(sys.platform=="linux", "Linux hard address-space allocation guard")
+    async def test_burst_allocation_is_rejected_before_resident_budget_is_exceeded(self):
+        settings = worker.WorkerSettings(memory_bytes=256*worker._MIB,
+                                         resident_bytes=64*worker._MIB)
+        with patch.object(worker.WorkerSettings, "from_environment", return_value=settings):
+            result = await self.run_worker("burst")
+        self.assertTrue(result["meta"]["allocationBlockedBeforeRSSGrowth"])
+        self.assert_reaped(await self.started())
+        self.assertEqual((await self.run_worker())["markdown"], "same document")
 
     async def test_timeout_kills_and_reaps_child(self):
         settings=worker.WorkerSettings(timeout_seconds=0.15)

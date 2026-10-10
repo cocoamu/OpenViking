@@ -58,9 +58,13 @@ class SemanticLockScope:
                 # ponytail: Replace this message check with a recoverable handoff
                 # exception when the native binding exposes typed handoff failures.
                 error_message = str(error)
+                consumed_handoff = (
+                    "pathlock handoff for owner '" in error_message
+                    and error_message.endswith("was already adopted")
+                )
                 if "is no longer owned by" not in error_message and (
                     "logical-path provider handoff requires covered_paths" not in error_message
-                ):
+                ) and not consumed_handoff:
                     raise
                 covered_paths = lock_handoff.get("covered_paths") or []
                 if not covered_paths:

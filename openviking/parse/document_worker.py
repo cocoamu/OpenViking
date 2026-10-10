@@ -251,7 +251,10 @@ async def convert_document_in_worker(
                 "resource_name": resource_name or path.stem,
                 "pdf_config": pdf_config or {},
                 "max_table_rows": max_table_rows,
-                "memory_bytes": settings.memory_bytes,
+                # RSS polling cannot stop a single large allocation before its
+                # next tick. Bound address space by the physical reservation too,
+                # so the OS rejects that allocation before pages are committed.
+                "memory_bytes": min(settings.memory_bytes, settings.resident_bytes),
                 "parent_pid": os.getpid(),
                 "staging_dir": str(directory / "media-stage"),
             }

@@ -1,6 +1,8 @@
 import asyncio
+import io
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from PIL import Image
 
 import pytest
 
@@ -13,6 +15,12 @@ from openviking_cli.utils.config.parser_config import ImageConfig
 
 
 ROOT = "viking://resources/account/document/chapter"
+
+
+def png(width=64, height=64):
+    stream = io.BytesIO()
+    Image.new("RGB", (width, height), "white").save(stream, format="PNG")
+    return stream.getvalue()
 
 
 def page(number=8, ref="page8_img1.png", text=None):
@@ -101,7 +109,7 @@ async def test_small_markdown_reads_do_not_spend_full_requested_byte_budget():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("enabled", [False, True])
 async def test_page_evidence_is_opt_in_and_original_image_is_still_read(monkeypatch, enabled):
-    original = b"original-image-content"
+    original = png()
     fs = SimpleNamespace(read_file_bytes=AsyncMock(return_value=original))
     client = SimpleNamespace(get_vision_completion_async=AsyncMock(return_value="visual summary"))
     config = SimpleNamespace(vlm=client, image=ImageConfig(reuse_pdf_page_text_for_summary=enabled))
@@ -126,6 +134,20 @@ async def test_enabled_option_without_verified_page_context_still_calls_vision(m
     monkeypatch.setattr(media_utils, "prepare_image_bytes_for_model", lambda b, **_kwargs: b)
     result = await media_utils.generate_image_summary(ROOT + "/standalone.png", "standalone.png")
     assert result["summary"] == "visual summary"
+    client.get_vision_completion_async.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content", [png(315, 251), png(513, 1), b"unknown-image-header"])
+async def test_large_or_unknown_image_keeps_visual_summary_even_with_page_text(monkeypatch, content):
+    fs = SimpleNamespace(read_file_bytes=AsyncMock(return_value=content))
+    client = SimpleNamespace(get_vision_completion_async=AsyncMock(return_value="white shoe, red laces, yellow midsole"))
+    monkeypatch.setattr(media_utils, "get_viking_fs", lambda: fs)
+    monkeypatch.setattr(media_utils, "get_openviking_config", lambda: SimpleNamespace(vlm=client, image=ImageConfig(reuse_pdf_page_text_for_summary=True)))
+    monkeypatch.setattr(media_utils, "render_prompt", lambda *_args: "prompt")
+    monkeypatch.setattr(media_utils, "prepare_image_bytes_for_model", lambda b, **_kwargs: b)
+    result = await media_utils.generate_image_summary(ROOT + "/page61_img6.png", "page61_img6.png", image_context="Source PDF page 61: KAI TEAM 2")
+    assert result["summary"] == "white shoe, red laces, yellow midsole"
     client.get_vision_completion_async.assert_awaited_once()
 
 

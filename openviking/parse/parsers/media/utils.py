@@ -246,6 +246,20 @@ def get_media_base_uri(media_type: str) -> str:
     return f"viking://resources/{media_dir}/{date_str}"
 
 
+def _can_reuse_pdf_page_text(image_bytes: bytes) -> bool:
+    """Keep visual descriptions for larger figures; inspect headers without decoding."""
+    import io
+
+    from PIL import Image
+
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            width, height = image.size
+            return 0 < width * height <= 32768 and max(width, height) <= 512
+    except Exception:
+        return False  # Unknown dimensions must use the existing vision path.
+
+
 async def generate_image_summary(
     image_uri: str,
     original_filename: str,
@@ -285,8 +299,12 @@ async def generate_image_summary(
             )
             return {"name": file_name, "summary": "SVG image (format not supported by VLM)"}
 
-        if image_context and getattr(
-            getattr(config, "image", None), "reuse_pdf_page_text_for_summary", False
+        if (
+            image_context
+            and getattr(
+                getattr(config, "image", None), "reuse_pdf_page_text_for_summary", False
+            )
+            and _can_reuse_pdf_page_text(image_bytes)
         ):
             # The DAG supplies this only for a referenced native PDF crop and a
             # multimodal embedder. Keep the image itself for visual retrieval;

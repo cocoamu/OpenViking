@@ -465,6 +465,8 @@ class MarkdownParser(BaseParser):
         viking_fs = self._get_viking_fs()
         mkdir_ops = [op for op in layout.ops if op.kind == "mkdir"]
         write_ops = [op for op in layout.ops if op.kind == "write"]
+        if len({op.uri for op in write_ops}) != len(write_ops):
+            raise ValueError("Markdown layout contains duplicate section output URIs")
         write_chars = sum(len(op.content or "") for op in write_ops)
 
         rewrite_enabled = rewrite_ctx is not None

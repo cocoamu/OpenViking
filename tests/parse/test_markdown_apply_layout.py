@@ -11,6 +11,8 @@ isolated while replaying their layouts.
 import asyncio
 from unittest.mock import patch
 
+import pytest
+
 from openviking.parse.parsers.base_parser import BaseParser
 from openviking.parse.parsers.markdown import MarkdownParser, _Layout, _LayoutOp
 
@@ -63,6 +65,17 @@ class InterleavingFakeVikingFS(FakeVikingFS):
 
 
 class TestApplyLayout:
+    async def test_duplicate_section_writes_fail_before_any_filesystem_mutation(self):
+        fake = FakeVikingFS()
+        parser = MarkdownParser()
+        layout = self._layout()
+        layout.ops.append(_LayoutOp("write", "viking://temp/root/doc/sec/a.md", "lost"))
+        with patch.object(BaseParser, "_get_viking_fs", return_value=fake):
+            with pytest.raises(ValueError, match="duplicate section output URIs"):
+                await parser._apply_layout(layout)
+        assert fake.mkdir_calls == []
+        assert fake.files == {}
+
     def _layout(self) -> _Layout:
         # One mkdir op is deliberately duplicated to show ops are replayed
         # verbatim rather than deduplicated.

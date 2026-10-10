@@ -226,7 +226,39 @@ class PDFParser(BaseParser):
     ) -> tuple[str, Dict[str, Any]]:
         # pdfplumber / pdfminer 的解析与图片/表格提取通常是 CPU/IO 密集且为同步实现，
         # 放到线程池中执行，避免阻塞事件循环。
-        return await asyncio.to_thread(self._convert_local_sync, pdf_path, storage, resource_name)
+        return await asyncio.to_thread(self._convert_local_with_reclaim, pdf_path, storage, resource_name)
+
+    def _convert_local_with_reclaim(
+        self, pdf_path: Path, storage=None, resource_name: Optional[str] = None
+    ) -> tuple[str, Dict[str, Any]]:
+        # Run cleanup in the same worker after the converter's frame has exited.
+        # Cancellation of the awaiting coroutine must not skip worker cleanup.
+        try:
+            return self._convert_local_sync(pdf_path, storage, resource_name)
+        finally:
+            self._reclaim_local_parse_memory(pdf_path)
+
+    @staticmethod
+    def _reclaim_local_parse_memory(pdf_path: Path) -> None:
+        """Return unused native buffers after a large local PDF on Linux."""
+        import sys
+
+        try:
+            # Small PDFs and platforms without glibc need no allocator operation.
+            if sys.platform != "linux" or Path(pdf_path).stat().st_size < 16 * 1024 * 1024:
+                return
+            import ctypes
+            import gc
+
+            gc.collect()
+            trim = getattr(ctypes.CDLL(None), "malloc_trim", None)
+            if trim is not None:
+                trim.argtypes = [ctypes.c_size_t]
+                trim.restype = ctypes.c_int
+                trim(0)
+        except Exception:
+            # Allocator availability or cleanup must not change a parse result.
+            logger.debug("Large PDF memory reclaim unavailable", exc_info=True)
 
     def _convert_local_sync(
         self, pdf_path: Path, storage=None, resource_name: Optional[str] = None

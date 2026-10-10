@@ -312,7 +312,9 @@ class PDFParser(BaseParser):
         }
 
         try:
-            with pdfplumber.open(str(pdf_path)) as pdf:
+            from openviking.parse.parsers.pdf_compat import open_pdf_compat
+
+            with open_pdf_compat(pdf_path, pdfplumber, meta, _PDF_RENDER_LOCK) as pdf:
                 meta["total_pages"] = len(pdf.pages)
 
                 # Extract structure (bookmarks → font fallback)

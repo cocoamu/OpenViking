@@ -69,13 +69,24 @@ class AnyDocParser(BaseParser):
 
         storage = get_storage()
         resource_name = kwargs.get("resource_name") or kwargs.get("source_name") or path.stem
-        conversion = await asyncio.to_thread(
-            AnyDocConverter().convert,
-            path,
-            resource_name=resource_name,
-            storage=storage,
-            max_table_rows=self.anydoc_config.max_table_rows,
-        )
+        from openviking.parse.document_worker import convert_document_in_worker, should_isolate
+        from openviking.parse.parsers.anydoc_converter import AnydocConversionResult
+        from openviking_cli.utils.storage import StoragePath
+
+        if should_isolate(path) and type(storage) is StoragePath:
+            data = await convert_document_in_worker(
+                "anydoc", path, resource_name=resource_name, storage=storage,
+                max_table_rows=self.anydoc_config.max_table_rows,
+            )
+            conversion = AnydocConversionResult(**{**data, "warnings": tuple(data.get("warnings", ()))})
+        else:
+            conversion = await asyncio.to_thread(
+                AnyDocConverter().convert,
+                path,
+                resource_name=resource_name,
+                storage=storage,
+                max_table_rows=self.anydoc_config.max_table_rows,
+            )
 
         markdown_kwargs = dict(kwargs)
         allowed_media_dirs = list(markdown_kwargs.get("allowed_media_dirs") or [])

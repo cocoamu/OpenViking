@@ -224,6 +224,24 @@ class PDFParser(BaseParser):
     async def _convert_local(
         self, pdf_path: Path, storage=None, resource_name: Optional[str] = None
     ) -> tuple[str, Dict[str, Any]]:
+        # Import the lightweight worker only once the package is fully loaded.
+        from openviking.parse.document_worker import should_isolate
+
+        if should_isolate(pdf_path):
+            from openviking.parse.document_worker import convert_document_in_worker
+            from openviking_cli.utils.storage import StoragePath, get_storage
+
+            worker_storage = get_storage() if storage is None else storage
+            # Custom storage implementations retain their existing in-process contract.
+            if type(worker_storage) is StoragePath:
+                result = await convert_document_in_worker(
+                    "pdf", pdf_path, storage=worker_storage, resource_name=resource_name,
+                    pdf_config={name: getattr(self.config, name) for name in (
+                        "heading_detection", "font_heading_min_delta",
+                        "max_heading_levels", "image_resolution",
+                    )},
+                )
+                return result["markdown"], result["meta"]
         # pdfplumber / pdfminer 的解析与图片/表格提取通常是 CPU/IO 密集且为同步实现，
         # 放到线程池中执行，避免阻塞事件循环。
         return await asyncio.to_thread(self._convert_local_with_reclaim, pdf_path, storage, resource_name)

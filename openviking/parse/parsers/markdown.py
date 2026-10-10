@@ -851,8 +851,8 @@ class MarkdownParser(BaseParser):
         for md_uri in md_uris:
             try:
                 content = await viking_fs.read_file(md_uri)
-            except Exception as exc:
-                raise RuntimeError("Failed to read a section while importing embedded images") from exc
+            except Exception:
+                raise
 
             # Collect all image references in this markdown file: markdown
             # embeds (![...]) and HTML <img src="..."> tags alike.
@@ -910,7 +910,7 @@ class MarkdownParser(BaseParser):
                     raise
                 for (origin_link, name, _), outcome in zip(pending, outcomes, strict=True):
                     if isinstance(outcome, BaseException):
-                        raise RuntimeError("Failed to persist an embedded image") from outcome
+                        raise outcome
                     file_mappings[origin_link] = name
                 pending.clear()
 
@@ -943,11 +943,11 @@ class MarkdownParser(BaseParser):
                     pending.append((origin_link, unique_filename, image_bytes))
                     del image_bytes
 
-                except Exception as e:
+                except Exception:
                     # Do not report a successful document after a valid local
                     # image could not be read or persisted. Policy rejections
                     # above remain explicit skips, just as on the serial path.
-                    raise RuntimeError("Failed to read an embedded image") from e
+                    raise
 
                 if len(pending) >= concurrency:
                     await flush_pending()

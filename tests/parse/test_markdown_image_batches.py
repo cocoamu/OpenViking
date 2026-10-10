@@ -11,6 +11,7 @@ from PIL import Image
 from openviking.parse.image_rewrite import IMAGE_MAPPINGS_FILENAME
 from openviking.parse.parsers.base_parser import BaseParser
 from openviking.parse.parsers.markdown import MarkdownParser
+from openviking_cli.exceptions import PermissionDeniedError, UnavailableError
 from openviking_cli.utils.config.parser_config import ParserConfig, PDFConfig
 
 ROOT = "viking://temp/image-batches/document"
@@ -49,7 +50,10 @@ class Store:
                 await self.release.wait()
             else:
                 await asyncio.sleep(0.01)
-            if uri.endswith(self.fail or "/never-fail"):
+            failed_name = "a.png" if isinstance(self.fail, Exception) else self.fail or "/never-fail"
+            if uri.endswith(failed_name):
+                if isinstance(self.fail, Exception):
+                    raise self.fail
                 raise OSError("storage failed")
             self.files[uri] = data
         finally:
@@ -98,8 +102,24 @@ async def test_storage_failure_is_terminal_after_other_batch_writes_settle(tmp_p
     image(tmp_path / "a.png")
     image(tmp_path / "b.png")
     store = Store("![a](a.png) ![b](b.png)", fail="a.png")
-    with pytest.raises(RuntimeError, match="persist an embedded image"):
+    with pytest.raises(OSError, match="storage failed"):
         await ingest(store, tmp_path, 2)
+    assert store.active == 0 and ROOT + "/b.png" in store.files
+    assert ROOT + "/" + IMAGE_MAPPINGS_FILENAME not in store.files
+
+
+@pytest.mark.parametrize(
+    "error", [PermissionDeniedError(resource="image"), UnavailableError(service="storage")]
+)
+async def test_structured_storage_error_survives_after_batch_settles(tmp_path, error):
+    image(tmp_path / "a.png")
+    image(tmp_path / "b.png")
+    store = Store("![a](a.png) ![b](b.png)", fail=error)
+    with pytest.raises(type(error)) as caught:
+        await ingest(store, tmp_path, 2)
+    assert caught.value is error
+    assert caught.value.code == error.code and caught.value.details == error.details
+    assert str(caught.value) == str(error)
     assert store.active == 0 and ROOT + "/b.png" in store.files
     assert ROOT + "/" + IMAGE_MAPPINGS_FILENAME not in store.files
 
@@ -120,8 +140,28 @@ async def test_cancellation_does_not_leave_active_batch_writes(tmp_path):
 async def test_failed_section_read_is_not_silently_successful(tmp_path):
     store = Store("![a](a.png)")
     store.files.clear()
-    with pytest.raises(RuntimeError, match="read a section"):
+    with pytest.raises(KeyError):
         await ingest(store, tmp_path, 2)
+
+
+async def test_section_permission_error_keeps_original_type_and_reason(tmp_path):
+    store = Store("![a](a.png)")
+    error = PermissionDeniedError(resource="section")
+    with patch.object(store, "read_file", side_effect=error):
+        with pytest.raises(PermissionDeniedError) as caught:
+            await ingest(store, tmp_path, 2)
+    assert caught.value is error
+    assert ROOT + "/" + IMAGE_MAPPINGS_FILENAME not in store.files
+
+
+async def test_valid_local_image_read_failure_is_not_hidden(tmp_path):
+    image(tmp_path / "a.png")
+    store = Store("![a](a.png)")
+    with patch("pathlib.Path.open", side_effect=OSError("local read failed")):
+        with pytest.raises(OSError, match="local read failed"):
+            await ingest(store, tmp_path, 2)
+    assert store.maximum == 0
+    assert ROOT + "/" + IMAGE_MAPPINGS_FILENAME not in store.files
 
 
 async def test_oversized_file_read_is_bounded_before_validation(tmp_path):

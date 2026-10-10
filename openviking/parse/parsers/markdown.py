@@ -494,6 +494,14 @@ class MarkdownParser(BaseParser):
         images_s = time.perf_counter() - images_started
 
         total_s = time.perf_counter() - started
+        layout.meta["markdown_apply_profile"] = {
+            "total_seconds": round(total_s, 3),
+            "mkdir_seconds": round(mkdir_s, 3),
+            "write_seconds": round(write_s, 3),
+            "images_seconds": round(images_s, 3),
+            "write_ops": len(write_ops),
+            "image_write_concurrency": getattr(self.config, "local_image_write_concurrency", 1),
+        }
         if _env_bool("OPENVIKING_MARKDOWN_APPLY_PROFILE", False):
             logger.info(
                 f"[MarkdownApplyProfile] total={total_s:.3f}s mkdir={mkdir_s:.3f}s "
@@ -825,6 +833,10 @@ class MarkdownParser(BaseParser):
         """
         viking_fs = self._get_viking_fs()
 
+        concurrency = getattr(self.config, "local_image_write_concurrency", 1)
+        if type(concurrency) is not int or not 1 <= concurrency <= 4:
+            raise ValueError("local_image_write_concurrency must be an integer between 1 and 4")
+
         # Find all processed markdown files under the root directory
         glob_result = await viking_fs.glob("**/*.md", uri=root_dir)
         md_uris = glob_result.get("matches", [])
@@ -839,9 +851,8 @@ class MarkdownParser(BaseParser):
         for md_uri in md_uris:
             try:
                 content = await viking_fs.read_file(md_uri)
-            except Exception:
-                logger.warning(f"[MarkdownParser] Failed to read markdown file: {md_uri}")
-                continue
+            except Exception as exc:
+                raise RuntimeError("Failed to read a section while importing embedded images") from exc
 
             # Collect all image references in this markdown file: markdown
             # embeds (![...]) and HTML <img src="..."> tags alike.
@@ -883,19 +894,45 @@ class MarkdownParser(BaseParser):
             # Copy each local image next to the markdown file, deduplicating names
             used_names: set[str] = set()
             file_mappings: Dict[str, str] = {}  # original_path_str -> unique_filename
+            pending: List[Tuple[str, str, bytes]] = []
+
+            async def flush_pending() -> None:
+                # Keep ordinary VikingFS ACL, encryption and path locking. Each
+                # batch is fully settled before mappings or the next batch proceed.
+                jobs = [
+                    asyncio.create_task(viking_fs.write_file_bytes(f"{md_dir}/{name}", data))
+                    for _, name, data in pending
+                ]
+                try:
+                    outcomes = await asyncio.gather(*jobs, return_exceptions=True)
+                except BaseException:
+                    await asyncio.gather(*jobs, return_exceptions=True)
+                    raise
+                for (origin_link, name, _), outcome in zip(pending, outcomes, strict=True):
+                    if isinstance(outcome, BaseException):
+                        raise RuntimeError("Failed to persist an embedded image") from outcome
+                    file_mappings[origin_link] = name
+                pending.clear()
+
+            def read_bounded(path: Path) -> bytes:
+                # Limit even a file that grows after path resolution. Existing
+                # image validation rejects the extra byte; never preload all assets.
+                with path.open("rb") as stream:
+                    return stream.read(self.IMAGE_MAX_FILE_BYTES + 1)
+
             for origin_link, resolved_path in zip(origin_images_links, local_images, strict=False):
                 try:
                     if not await asyncio.to_thread(resolved_path.exists):
-                        logger.warning(f"[MarkdownParser] Image file not found: {resolved_path}")
-                        continue
+                        raise FileNotFoundError(resolved_path)
 
                     # Read image bytes
-                    image_bytes = await asyncio.to_thread(resolved_path.read_bytes)
+                    image_bytes = await asyncio.to_thread(read_bounded, resolved_path)
 
                     # Validate pixel size and file size; skip non-compliant images
                     if not await asyncio.to_thread(
                         self._is_valid_image, image_bytes, resolved_path
                     ):
+                        del image_bytes
                         continue
 
                     # Get filename and deduplicate
@@ -903,15 +940,20 @@ class MarkdownParser(BaseParser):
                     unique_filename = self._deduplicate_filename(filename, used_names)
                     used_names.add(unique_filename)
 
-                    # Write next to the markdown file
-                    viking_path = f"{md_dir}/{unique_filename}"
-                    await viking_fs.write_file_bytes(viking_path, image_bytes)
-
-                    # Record mapping for post-commit rewrite
-                    file_mappings[origin_link] = unique_filename
+                    pending.append((origin_link, unique_filename, image_bytes))
+                    del image_bytes
 
                 except Exception as e:
-                    logger.warning(f"[MarkdownParser] Failed to ingest image {resolved_path}: {e}")
+                    # Do not report a successful document after a valid local
+                    # image could not be read or persisted. Policy rejections
+                    # above remain explicit skips, just as on the serial path.
+                    raise RuntimeError("Failed to read an embedded image") from e
+
+                if len(pending) >= concurrency:
+                    await flush_pending()
+
+            if pending:
+                await flush_pending()
 
             if file_mappings:
                 rel_md_path = (

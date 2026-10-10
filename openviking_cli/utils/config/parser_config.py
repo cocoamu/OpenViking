@@ -45,6 +45,9 @@ class ParserConfig:
     max_section_size: int = 2048  # Maximum tokens per section before splitting
     section_size_flexibility: float = 0.3  # Allow 30% overflow to maintain coherence
     max_section_chars: int = 6000  # Target character limit per section
+    # Local embedded image writes only; defaults to the existing serial path.
+    # Bound memory and storage load even when a document embeds thousands of files.
+    local_image_write_concurrency: int = 1
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ParserConfig":
@@ -117,6 +120,12 @@ class ParserConfig:
 
         if self.max_section_chars <= 0:
             raise ValueError("max_section_chars must be positive")
+
+        if (
+            type(self.local_image_write_concurrency) is not int
+            or not 1 <= self.local_image_write_concurrency <= 4
+        ):
+            raise ValueError("local_image_write_concurrency must be an integer between 1 and 4")
 
     def to_dict(self) -> Dict[str, Any]:
         """

@@ -13,7 +13,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 
 SOURCE = Path(__file__).parents[2] / "openviking/parse/document_worker.py"
@@ -115,6 +115,82 @@ class MemoryAdmissionTests(unittest.TestCase):
             with patch.dict(os.environ, {"OPENVIKING_DOCUMENT_WORKER_TIMEOUT": value}):
                 with self.assertRaises(ValueError):
                     worker.WorkerSettings.from_environment()
+
+
+@unittest.skipUnless(os.name == "posix", "Process-group lifecycle requires POSIX")
+class ParentReclaimTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        worker._ACTIVE_WORKERS = 0
+        worker._NEXT_RECLAIM_AT = 0
+
+    async def asyncTearDown(self):
+        worker._ACTIVE_WORKERS = 0
+        worker._NEXT_RECLAIM_AT = 0
+
+    async def test_pressure_reclaim_allows_slot_only_after_memory_really_drops(self):
+        settings = worker.WorkerSettings(memory_bytes=30, resident_bytes=30)
+        used = [90]
+        def reclaim():
+            used[0] = 40
+        with patch.object(worker.sys, "platform", "linux"), \
+             patch.object(worker, "_memory_snapshot", side_effect=lambda: (used[0], 100)), \
+             patch.object(worker, "_reclaim_parent_memory", side_effect=reclaim) as action:
+            async with worker._worker_slot(settings):
+                self.assertEqual(worker._ACTIVE_WORKERS, 1)
+                self.assertEqual(action.call_count, 1)
+        self.assertEqual(worker._ACTIVE_WORKERS, 0)
+
+    async def test_reclaim_failure_to_free_memory_never_bypasses_admission(self):
+        settings = worker.WorkerSettings(admission_timeout_seconds=0.1)
+        with patch.object(worker.sys, "platform", "linux"), \
+             patch.object(worker, "_memory_snapshot", return_value=(99, 100)), \
+             patch.object(worker, "_reclaim_parent_memory") as action:
+            with self.assertRaisesRegex(worker.DocumentWorkerError, "ADMISSION_TIMEOUT"):
+                async with worker._worker_slot(settings):
+                    self.fail("Unsafe slot was admitted")
+            self.assertEqual(action.call_count, 1)
+        self.assertEqual(worker._ACTIVE_WORKERS, 0)
+
+    async def test_low_pressure_and_running_workers_do_not_trigger_gc(self):
+        settings = worker.WorkerSettings(memory_bytes=30, resident_bytes=30)
+        with patch.object(worker.sys, "platform", "linux"), \
+             patch.object(worker, "_reclaim_parent_memory") as action:
+            with patch.object(worker, "_memory_snapshot", return_value=(10, 100)):
+                await worker._maybe_reclaim_parent_memory(settings)
+            worker._ACTIVE_WORKERS = 1
+            with patch.object(worker, "_memory_snapshot", return_value=(99, 100)):
+                await worker._maybe_reclaim_parent_memory(settings)
+            action.assert_not_called()
+
+    async def test_concurrent_pressure_probes_share_reclaim_cooldown(self):
+        with patch.object(worker.sys, "platform", "linux"), \
+             patch.object(worker, "_memory_snapshot", return_value=(99, 100)), \
+             patch.object(worker, "_reclaim_parent_memory") as action:
+            await asyncio.gather(*[worker._maybe_reclaim_parent_memory(worker.WorkerSettings())
+                                   for _ in range(8)])
+            self.assertEqual(action.call_count, 1)
+
+    async def test_non_linux_reclaim_is_skipped(self):
+        with patch.object(worker.sys, "platform", "darwin"), \
+             patch.object(worker, "_reclaim_parent_memory") as action:
+            await worker._maybe_reclaim_parent_memory(worker.WorkerSettings())
+            action.assert_not_called()
+
+    async def test_allocator_reclaim_preserves_live_data(self):
+        live = bytearray(b"keep this document")
+        trim = MagicMock(return_value=1)
+        with patch.object(worker.ctypes, "CDLL", return_value=SimpleNamespace(malloc_trim=trim)), \
+             patch.object(worker.gc, "collect") as collect:
+            worker._reclaim_parent_memory()
+        collect.assert_called_once()
+        trim.assert_called_once_with(0)
+        self.assertEqual(live, b"keep this document")
+
+    async def test_missing_allocator_trim_remains_safe(self):
+        with patch.object(worker.ctypes, "CDLL", side_effect=OSError("unavailable")), \
+             patch.object(worker.gc, "collect") as collect:
+            worker._reclaim_parent_memory()
+        collect.assert_called_once()
 
 
 @unittest.skipUnless(os.name == "posix", "Process-group lifecycle requires POSIX")

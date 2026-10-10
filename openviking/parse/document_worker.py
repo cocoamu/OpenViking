@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
+import gc
 import json
 import logging
 import math
@@ -21,6 +23,7 @@ logger = logging.getLogger(__name__)
 _MIB = 1024 * 1024
 _ADMISSION_LOCK = threading.Lock()
 _ACTIVE_WORKERS = 0
+_NEXT_RECLAIM_AT = 0.0
 
 
 class DocumentWorkerError(RuntimeError):
@@ -101,11 +104,44 @@ def _try_acquire(settings: WorkerSettings) -> bool:
         return True
 
 
+def _reclaim_parent_memory() -> None:
+    """Return unused allocator pages; live objects and admission limits stay intact."""
+    before = _memory_snapshot()
+    gc.collect()
+    try:
+        trim = getattr(ctypes.CDLL(None), "malloc_trim", None)
+        if trim is not None:
+            trim.argtypes = [ctypes.c_size_t]
+            trim.restype = ctypes.c_int
+            trim(0)
+    except (OSError, AttributeError):
+        logger.debug("Parent allocator reclaim unavailable", exc_info=True)
+    logger.info("Document worker parent memory reclaim before=%s after=%s",
+                before, _memory_snapshot())
+
+
+async def _maybe_reclaim_parent_memory(settings: WorkerSettings) -> None:
+    """Try reclaim at most once per 30s when idle native workers cannot fit."""
+    global _NEXT_RECLAIM_AT
+    if sys.platform != "linux":
+        return
+    with _ADMISSION_LOCK:
+        snapshot = _memory_snapshot()
+        now = time.monotonic()
+        if (_ACTIVE_WORKERS or snapshot is None or now < _NEXT_RECLAIM_AT
+                or snapshot[0] + min(settings.resident_bytes, settings.memory_bytes)
+                <= int(snapshot[1] * 0.85)):
+            return
+        _NEXT_RECLAIM_AT = now + 30
+    await asyncio.to_thread(_reclaim_parent_memory)
+
+
 @asynccontextmanager
 async def _worker_slot(settings: WorkerSettings):
     global _ACTIVE_WORKERS
     started, next_log = time.monotonic(), time.monotonic()
     while not _try_acquire(settings):
+        await _maybe_reclaim_parent_memory(settings)
         elapsed = time.monotonic() - started
         if elapsed >= settings.admission_timeout_seconds:
             raise DocumentWorkerError("DOCUMENT_WORKER_ADMISSION_TIMEOUT: memory budget unavailable")

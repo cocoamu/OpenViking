@@ -79,15 +79,33 @@ def should_isolate(path: Path) -> bool:
 
 
 def _memory_snapshot() -> tuple[int, int] | None:
-    """Read the container's current usage and limit, supporting cgroup v1/v2."""
-    for current, limit in (
-        ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.max"),
+    """Read conservative working-set usage and limit, supporting cgroup v1/v2.
+
+    Charged memory includes reclaimable file cache. Reserving a native worker
+    against that entire charge can prevent allocation (and hence kernel reclaim)
+    indefinitely. Discount only clean inactive file pages; keep active cache,
+    shared memory, dirty pages and writeback charged. Missing stats fail closed.
+    """
+    for current, limit, stat_path, fields in (
+        ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.max",
+         "/sys/fs/cgroup/memory.stat",
+         ("inactive_file", "file", "shmem", "file_dirty", "file_writeback")),
         ("/sys/fs/cgroup/memory/memory.usage_in_bytes",
-         "/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+         "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+         "/sys/fs/cgroup/memory/memory.stat",
+         ("total_inactive_file", "total_cache", "total_shmem", "total_dirty", "total_writeback")),
     ):
         try:
             used, capacity = int(Path(current).read_text()), int(Path(limit).read_text())
             if 0 <= used and 0 < capacity < (1 << 60):
+                try:
+                    stats = dict(line.split() for line in Path(stat_path).read_text().splitlines())
+                    inactive, file_bytes, shmem, dirty, writeback = (int(stats[k]) for k in fields)
+                    if min(inactive, file_bytes, shmem, dirty, writeback) >= 0:
+                        clean_inactive = max(0, min(inactive, file_bytes) - shmem - dirty - writeback)
+                        used -= min(used, clean_inactive)
+                except (OSError, ValueError, KeyError):
+                    pass
                 return used, capacity
         except (OSError, ValueError):
             continue

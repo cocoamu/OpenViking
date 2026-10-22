@@ -15,6 +15,7 @@ from openviking.service.task_work_index import bind_task_context
 from openviking.storage.queuefs.named_queue import DequeueHandlerBase
 from openviking.storage.queuefs.process_result import ProcessResult
 from openviking.storage.queuefs.session_commit_msg import SessionCommitMsg
+from openviking.storage.queuefs.retry_policy import max_attempts
 from openviking.telemetry.span_models import create_root_span_attributes
 from openviking_cli.session.user_id import UserIdentifier
 
@@ -83,11 +84,16 @@ class SessionCommitProcessor(DequeueHandlerBase):
                 processed = await session.resume_queued_commit(msg)
             if not processed:
                 from openviking.storage.queuefs import QueueManager, get_queue_manager
-
-                await get_queue_manager().enqueue(
-                    QueueManager.SESSION_COMMIT,
-                    msg.to_dict(),
-                )
+                if msg.attempt + 1 >= max_attempts():
+                    tracker = get_task_tracker()
+                    await tracker.create("session_commit", resource_id=msg.session_id,
+                        account_id=ctx.account_id, user_id=ctx.user.user_id, task_id=msg.task_id)
+                    await tracker.fail(msg.task_id, "session commit retry limit exceeded",
+                        account_id=ctx.account_id, user_id=ctx.user.user_id,
+                        result={"failure_category": "upstream", "attempts": msg.attempt + 1})
+                    return True
+                msg.attempt += 1
+                await get_queue_manager().enqueue(QueueManager.SESSION_COMMIT, msg.to_dict())
             return processed
         finally:
             reset_root_observability_context(root_context_token)

@@ -46,6 +46,7 @@ from openviking.storage.acl import CreatorAclGrant
 from openviking.storage.errors import LockAcquisitionError
 from openviking.storage.queuefs.named_queue import DequeueHandlerBase
 from openviking.storage.queuefs.process_result import ProcessResult
+from openviking.storage.queuefs.retry_policy import failure_category, should_retry
 from openviking.storage.queuefs.semantic_dag import DagStats, SemanticDagExecutor
 from openviking.storage.queuefs.semantic_lock import SemanticLockScope
 from openviking.storage.queuefs.semantic_msg import SemanticMsg, build_semantic_coalesce_key
@@ -231,7 +232,13 @@ class SemanticProcessor(DequeueHandlerBase):
         msg: SemanticMsg,
         error: Exception,
     ) -> ProcessResult:
+        category = failure_category(error)
+        if not should_retry(msg.attempt, category):
+            self._merge_request_stats(msg.telemetry_id, error_count=1)
+            get_request_wait_tracker().mark_semantic_failed(msg.telemetry_id, msg.id, str(error))
+            return ProcessResult.failed(str(error), failure_category=category)
         try:
+            msg.attempt += 1
             await self._reenqueue_semantic_msg(msg)
             self._merge_request_stats(msg.telemetry_id, requeue_count=1)
             get_request_wait_tracker().record_semantic_requeue(msg.telemetry_id)
@@ -239,7 +246,7 @@ class SemanticProcessor(DequeueHandlerBase):
             logger.error(f"Failed to re-enqueue semantic message: {requeue_err}")
             self._merge_request_stats(msg.telemetry_id, error_count=1)
             get_request_wait_tracker().mark_semantic_failed(msg.telemetry_id, msg.id, str(error))
-            return ProcessResult.failed(str(error))
+            return ProcessResult.failed(str(error), failure_category="upstream")
         return ProcessResult.requeued()
 
     async def _enqueue_parent_refresh(
@@ -382,6 +389,11 @@ class SemanticProcessor(DequeueHandlerBase):
                 logger.warning(
                     f"Circuit breaker is open, re-enqueueing semantic message: {msg.uri}"
                 )
+                if not should_retry(msg.attempt, "upstream"):
+                    self._merge_request_stats(msg.telemetry_id, error_count=1)
+                    get_request_wait_tracker().mark_semantic_failed(msg.telemetry_id, msg.id, "circuit breaker open")
+                    return ProcessResult.failed("circuit breaker open", failure_category="upstream")
+                msg.attempt += 1
                 await self._reenqueue_semantic_msg(msg)
                 self._merge_request_stats(msg.telemetry_id, requeue_count=1)
                 get_request_wait_tracker().record_semantic_requeue(msg.telemetry_id)
@@ -537,7 +549,7 @@ class SemanticProcessor(DequeueHandlerBase):
                 )
                 if msg is not None:
                     return await self._requeue_semantic_msg_after_error(msg, e)
-                return ProcessResult.failed(str(e))
+                return ProcessResult.failed(str(e), failure_category="upstream")
 
             error_class = classify_api_error(e)
             if error_class == ERROR_CLASS_INPUT_TOO_LARGE:
@@ -550,7 +562,7 @@ class SemanticProcessor(DequeueHandlerBase):
                     get_request_wait_tracker().mark_semantic_failed(
                         msg.telemetry_id, msg.id, str(e)
                     )
-                return ProcessResult.failed(str(e))
+                return ProcessResult.failed(str(e), failure_category="malformed")
             elif error_class == ERROR_CLASS_PERMANENT:
                 logger.critical(
                     f"Permanent API error processing semantic message, dropping: {e}",
@@ -562,7 +574,7 @@ class SemanticProcessor(DequeueHandlerBase):
                     get_request_wait_tracker().mark_semantic_failed(
                         msg.telemetry_id, msg.id, str(e)
                     )
-                return ProcessResult.failed(str(e))
+                return ProcessResult.failed(str(e), failure_category="upstream")
             else:
                 # Transient or unknown — re-enqueue for retry
                 logger.warning(
@@ -572,7 +584,7 @@ class SemanticProcessor(DequeueHandlerBase):
                 self._circuit_breaker.record_failure(e)
                 if msg is not None:
                     return await self._requeue_semantic_msg_after_error(msg, e)
-                return ProcessResult.failed(str(e))
+                return ProcessResult.failed(str(e), failure_category="upstream")
 
     async def on_cancelled(self, data: Optional[Dict[str, Any]]) -> ProcessResult:
         """Release a queued semantic lock before cancelled work is ACKed."""
@@ -725,6 +737,11 @@ class SemanticProcessor(DequeueHandlerBase):
                 file_summaries[idx] = {
                     "name": str(summary_dict.get("name") or file_name),
                     "summary": str(summary_dict.get("summary") or ""),
+                    **{
+                        key: summary_dict[key]
+                        for key in ("failure_category", "failure_code")
+                        if summary_dict.get(key)
+                    },
                 }
 
             batch_size = max(1, min(self.max_concurrent_llm, 10))

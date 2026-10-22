@@ -123,11 +123,32 @@ class PDFParser(BaseParser):
             )
 
         try:
-            # Step 1: Convert PDF to Markdown
-            markdown_content, conversion_meta = await self._convert_to_markdown(
-                pdf_path,
-                resource_name=resource_name,
+            with pdf_path.open("rb") as source_file:
+                if source_file.read(5) != b"%PDF-":
+                    return create_parse_result(
+                        root=ResourceNode(type=NodeType.ROOT), source_path=str(pdf_path),
+                        source_format="pdf", parser_name="PDFParser",
+                        parse_time=time.time() - start_time,
+                        meta={"failure_category": "malformed", "failure_code": "MALFORMED_PDF"},
+                        warnings=["MALFORMED_PDF: missing PDF magic bytes"],
+                    )
+        except OSError as exc:
+            return create_parse_result(
+                root=ResourceNode(type=NodeType.ROOT), source_path=str(pdf_path),
+                source_format="pdf", parser_name="PDFParser", parse_time=time.time() - start_time,
+                meta={"failure_category": "malformed", "failure_code": "PDF_READ_FAILED"},
+                warnings=[f"PDF_READ_FAILED: {exc}"],
             )
+
+        try:
+            # Step 1: Convert PDF to Markdown
+            size_mb = pdf_path.stat().st_size / (1024 * 1024)
+            timeout = (
+                self.config.local_conversion_timeout_seconds
+                + size_mb * self.config.local_conversion_seconds_per_mb
+            )
+            conversion = self._convert_to_markdown(pdf_path, resource_name=resource_name)
+            markdown_content, conversion_meta = await asyncio.wait_for(conversion, timeout=timeout)
 
             # Step 2: Parse Markdown using MarkdownParser, pass through resource name
             md_parser = self._get_markdown_parser()
@@ -162,6 +183,14 @@ class PDFParser(BaseParser):
 
             return result
 
+        except asyncio.TimeoutError as e:
+            logger.error("Failed to parse PDF %s: local conversion timed out", pdf_path)
+            return create_parse_result(
+                root=ResourceNode(type=NodeType.ROOT), source_path=str(pdf_path), source_format="pdf",
+                parser_name="PDFParser", parse_time=time.time() - start_time,
+                meta={"failure_category": "timeout", "failure_code": "DOCUMENT_WORKER_TIMEOUT"},
+                warnings=["DOCUMENT_WORKER_TIMEOUT: local conversion exceeded budget"],
+            )
         except Exception as e:
             logger.error(f"Failed to parse PDF {pdf_path}: {e}")
             return create_parse_result(
@@ -170,6 +199,14 @@ class PDFParser(BaseParser):
                 source_format="pdf",
                 parser_name="PDFParser",
                 parse_time=time.time() - start_time,
+                meta={
+                    "failure_category": (
+                        "timeout" if "timeout" in str(e).lower()
+                        else "malformed" if any(word in str(e).lower() for word in ("malformed", "invalid", "convert"))
+                        else "upstream"
+                    ),
+                    "failure_code": "DOCUMENT_WORKER_FAILED",
+                },
                 warnings=[f"Failed to parse PDF: {e}"],
             )
 

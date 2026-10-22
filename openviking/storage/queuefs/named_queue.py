@@ -113,7 +113,10 @@ class NamedQueue:
 
     def _record_result(self, result: ProcessResult, data: Dict[str, Any]) -> None:
         if result.outcome is ProcessOutcome.FAILED:
-            self._record_error(result.error, data)
+            error_data = dict(data or {})
+            if result.failure_category:
+                error_data["failure_category"] = result.failure_category
+            self._record_error(result.error, error_data)
             return
         with self._lock:
             # Keep the existing processed count: settled non-error deliveries,

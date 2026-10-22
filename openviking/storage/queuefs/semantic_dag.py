@@ -835,6 +835,11 @@ class SemanticDagExecutor:
             {
                 "name": str(summary_dict.get("name") or file_name),
                 "summary": str(summary_dict.get("summary") or ""),
+                **{
+                    key: summary_dict[key]
+                    for key in ("failure_category", "failure_code")
+                    if summary_dict.get(key)
+                },
             },
         )
 

@@ -62,6 +62,7 @@ class AddResourceMsg:
     tags: Optional[list[str]] = None
     tag_mode: str = "replace"
     internal_task: bool = False
+    attempt: int = 0
 
     def __post_init__(self) -> None:
         inferred = (
@@ -92,6 +93,7 @@ class AddResourceMsg:
         if source_payload_count > 1:
             raise ValueError("source jobs cannot contain multiple source payloads")
         self.job_phase = phase
+        self.attempt = max(0, int(self.attempt or 0))
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -212,4 +214,5 @@ class AddResourceMsg:
             tags=(list(data["tags"]) if isinstance(data.get("tags"), list) else None),
             tag_mode=str(data.get("tag_mode") or "replace"),
             internal_task=bool(data.get("internal_task", False)),
+            attempt=data.get("attempt", 0),
         )

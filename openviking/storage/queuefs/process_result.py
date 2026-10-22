@@ -25,6 +25,7 @@ class ProcessResult:
     outcome: ProcessOutcome
     value: Any = None
     error: Optional[str] = None
+    failure_category: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.outcome, ProcessOutcome):
@@ -34,14 +35,16 @@ class ProcessResult:
                 raise ValueError("failed results require an error string")
         elif self.error is not None:
             raise ValueError("only failed results may contain an error")
+        elif self.failure_category is not None:
+            raise ValueError("only failed results may contain a failure category")
 
     @classmethod
     def success(cls, value: Any = None) -> "ProcessResult":
         return cls(ProcessOutcome.SUCCESS, value=value)
 
     @classmethod
-    def failed(cls, error: str) -> "ProcessResult":
-        return cls(ProcessOutcome.FAILED, error=error)
+    def failed(cls, error: str, failure_category: Optional[str] = None) -> "ProcessResult":
+        return cls(ProcessOutcome.FAILED, error=error, failure_category=failure_category)
 
     @classmethod
     def requeued(cls) -> "ProcessResult":

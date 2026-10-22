@@ -26,6 +26,7 @@ from openviking.storage.errors import (
     EmbeddingRebuildRequiredError,
 )
 from openviking.storage.queuefs.embedding_msg import EmbeddingMsg
+from openviking.storage.queuefs.retry_policy import should_retry
 from openviking.storage.queuefs.named_queue import DequeueHandlerBase
 from openviking.storage.queuefs.process_result import ProcessResult
 from openviking.storage.vector_ids import vector_record_id
@@ -645,9 +646,15 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                 except CircuitBreakerOpen:
                     self._log_breaker_open_reenqueue_summary()
                     if self._vikingdb.has_queue_manager:
+                        if not should_retry(embedding_msg.attempt, "upstream"):
+                            error_msg = self._embedding_error_msg(embedding_msg, "Circuit breaker retry limit exceeded")
+                            self._merge_request_stats(embedding_msg.telemetry_id, error_count=1)
+                            request_failed_message = error_msg
+                            return ProcessResult.failed(error_msg, failure_category="upstream")
                         wait = self._circuit_breaker.retry_after
                         if wait > 0:
                             await asyncio.sleep(wait)
+                        embedding_msg.attempt += 1
                         await self._vikingdb.enqueue_embedding_msg(embedding_msg)
                         self._merge_request_stats(
                             embedding_msg.telemetry_id,
@@ -739,6 +746,11 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                         self._circuit_breaker.record_failure(embed_err)
                         if self._vikingdb.has_queue_manager:
                             try:
+                                if not should_retry(embedding_msg.attempt, "upstream"):
+                                    self._merge_request_stats(embedding_msg.telemetry_id, error_count=1)
+                                    request_failed_message = error_msg
+                                    return ProcessResult.failed(error_msg, failure_category="upstream")
+                                embedding_msg.attempt += 1
                                 await self._vikingdb.enqueue_embedding_msg(embedding_msg)
                                 self._merge_request_stats(
                                     embedding_msg.telemetry_id,

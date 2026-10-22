@@ -142,6 +142,18 @@ def _is_svg(data: bytes) -> bool:
     return data[:4] == b"<svg" or (data[:5] == b"<?xml" and b"<svg" in data[:100])
 
 
+def _has_supported_image_magic(data: bytes) -> bool:
+    """Reject mislabeled uploads before sending them to a VLM provider."""
+    return (
+        data.startswith(b"\x89PNG\r\n\x1a\n")
+        or data.startswith(b"\xff\xd8\xff")
+        or data.startswith((b"GIF87a", b"GIF89a"))
+        or data.startswith(b"BM")
+        or (data.startswith(b"RIFF") and data[8:12] == b"WEBP")
+        or (data.startswith(b"II*\x00") or data.startswith(b"MM\x00*"))
+    )
+
+
 def _convert_svg_to_png(svg_data: bytes) -> Optional[bytes]:
     """Convert SVG to PNG using cairosvg or wand.
 
@@ -282,6 +294,17 @@ async def generate_image_summary(
                 f"[MediaUtils.generate_image_summary] SVG format detected, skipping VLM analysis: {image_uri}"
             )
             return {"name": file_name, "summary": "SVG image (format not supported by VLM)"}
+        if not _has_supported_image_magic(image_bytes):
+            logger.warning(
+                "[MediaUtils.generate_image_summary] Invalid image magic bytes: %s",
+                image_bytes[:8].hex(),
+            )
+            return {
+                "name": file_name,
+                "summary": "",
+                "failure_category": "malformed",
+                "failure_code": "INVALID_IMAGE_MAGIC_BYTES",
+            }
 
         logger.info(
             f"[MediaUtils.generate_image_summary] Generating summary for image: {image_uri}"

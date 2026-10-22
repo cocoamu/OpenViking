@@ -165,6 +165,8 @@ class PDFConfig(ParserConfig):
 
     # Image extraction configuration
     image_resolution: int = 300  # Rendering DPI for extracted image regions
+    local_conversion_timeout_seconds: float = 300.0
+    local_conversion_seconds_per_mb: float = 2.0
 
     def validate(self) -> None:
         """
@@ -188,6 +190,10 @@ class PDFConfig(ParserConfig):
 
         if self.mineru_timeout <= 0:
             raise ValueError("mineru_timeout must be positive")
+        if self.local_conversion_timeout_seconds <= 0:
+            raise ValueError("local_conversion_timeout_seconds must be positive")
+        if self.local_conversion_seconds_per_mb < 0:
+            raise ValueError("local_conversion_seconds_per_mb must be non-negative")
 
         if self.heading_detection not in ("bookmarks", "font", "auto", "none"):
             raise ValueError(f"Invalid heading_detection: {self.heading_detection}")

@@ -12,6 +12,7 @@ from openviking.service.task_work_index import TaskWorkRejected
 from openviking.storage.queuefs import QueueManager, get_queue_manager
 from openviking.storage.queuefs.named_queue import DequeueHandlerBase
 from openviking.storage.queuefs.process_result import ProcessResult
+from openviking.storage.queuefs.retry_policy import max_attempts
 
 
 class ExternalTaskProcessor(DequeueHandlerBase):
@@ -47,9 +48,15 @@ class ExternalTaskProcessor(DequeueHandlerBase):
             # Register a new delivery before the old one is ACKed. Keeping the
             # task ID preserves cancellation and task-owned work across rotation.
             try:
+                payload = data.get("data", data)
+                if isinstance(payload, str):
+                    payload = json.loads(payload)
+                attempt = int(payload.get("attempt", 0) or 0)
+                if attempt + 1 >= max_attempts():
+                    return ProcessResult.failed("external task retry limit exceeded", failure_category="upstream")
                 await get_queue_manager().enqueue(
                     QueueManager.EXTERNAL_TASK,
-                    {"task_id": task_id, "account_id": account_id, "user_id": user_id},
+                    {"task_id": task_id, "account_id": account_id, "user_id": user_id, "attempt": attempt + 1},
                 )
             except TaskWorkRejected:
                 # Cancellation only needs the current delivery to be ACKed.

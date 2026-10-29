@@ -30,6 +30,7 @@ from openviking.parse.base import (
     lazy_import,
 )
 from openviking.parse.parsers.base_parser import BaseParser
+from openviking.parse.pdf_image_owner import image_product_owner
 from openviking.utils.time_utils import parse_iso_datetime
 from openviking_cli.utils import get_logger
 from openviking_cli.utils.config.parser_config import PDFConfig
@@ -416,9 +417,20 @@ class PDFParser(BaseParser):
 
                                     # Generate path relative to the media root.
                                     rel_path = image_path.relative_to(storage.media_dir)
+                                    try:
+                                        owner_code = image_product_owner(page, img)
+                                    except Exception:
+                                        owner_code = None
+                                    owner_caption = (
+                                        f"\n图片所在版面区域的唯一货号：{owner_code}"
+                                        if owner_code else ""
+                                    )
+                                    image_alt = f"Page {page_num} Image {img_idx + 1}"
+                                    if owner_code:
+                                        image_alt += f"；版面区域货号：{owner_code}"
                                     parts.append(
                                         f"<!-- Page {page_num} Image {img_idx + 1} -->\n"
-                                        f"![Page {page_num} Image {img_idx + 1}]({rel_path})"
+                                        f"![{image_alt}]({rel_path}){owner_caption}"
                                     )
                                     meta["images_extracted"] += 1
                             except Exception as img_err:

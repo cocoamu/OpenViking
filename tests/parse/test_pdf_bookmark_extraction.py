@@ -392,8 +392,8 @@ class TestConvertLocalBookmarks:
         assert meta["images_deduplicated"] == 1
 
     @pytest.mark.asyncio
-    async def test_convert_local_keeps_distinct_images_and_repeats_across_pages(self):
-        """Dedup is per-page: a logo on every page survives on every page."""
+    async def test_convert_local_keeps_first_occurrence_of_repeats_across_pages(self):
+        """EXEPD-228951: dedup is document-wide, so a logo repeated on every page is kept once."""
         parser = PDFParser()
         logo = {"x0": 0.0, "top": 0.0, "x1": 50.0, "bottom": 50.0}
         figure = {"x0": 0.0, "top": 200.0, "x1": 300.0, "bottom": 400.0}
@@ -427,8 +427,11 @@ class TestConvertLocalBookmarks:
                 "dummy.pdf", storage=storage, resource_name="dummy"
             )
 
-        assert meta["images_extracted"] == 3
-        assert meta["images_deduplicated"] == 0
+        # 第 2 页那张 logo 与第 1 页逐字节相同 ⇒ 跨页去重掉（旧行为是「每页各留一张」）。
+        # 这里只有 2 页，达不到模板图阈值（3 页），所以第一张 logo 仍保留。
+        assert meta["images_extracted"] == 2
+        assert meta["images_deduplicated"] == 1
+        assert meta["images_decorative_dropped"] == 0
 
     @pytest.mark.asyncio
     async def test_convert_local_closes_page_after_each_page(self):

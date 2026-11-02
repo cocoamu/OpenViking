@@ -36,6 +36,25 @@ from openviking_cli.utils.config.parser_config import PDFConfig
 
 logger = get_logger(__name__)
 
+# EXEPD-228951：页眉/装饰图的识别阈值，**必须是组合规则**。
+# 同一份 PDF 的页眉 logo 每页都出现、是模板资产、在版面上很小；而真实产品图即使尺寸不大，
+# 内容 hash 也不会跨多页重复（换一页就是另一张图）。所以只在
+# 「同一份字节内容重复出现在 ≥ DECORATIVE_REPEAT_PAGES 页」**且**「版面上与栅格化后都很小」
+# 三条同时成立时才剔除：
+#   * 只看尺寸会误删真实小图（接口图、图标、规格表小图）；
+#   * 只看位置（页眉区域）会误删页眉处的真实产品图；
+#   * 只看重复次数会误删「多页共用的真实示意图」（这类图通常比页眉 logo 大得多）。
+# 3 页是「页眉」与「偶然重复两次」的分界（两页重复在双页跨页排版里很常见，不构成模板资产）。
+#
+# ⚠️ 尺寸为什么用**版面点值**而不是像素：像素阈值会随 raster 分辨率漂移。实测同一枚
+# 60pt 的页眉 logo，在 300dpi 下是 250×250px，而 PRE 现场那份 PDF 是 116×116px——
+# 用固定像素阈值要么漏（250>200）要么误伤。点值是版面语义、与 DPI 无关：
+# 120pt ≈ 42mm，页眉 logo/水印都在这个量级，真实外观图（现场 1750×1254）远大于此。
+# 再叠一条像素上限（600px）兜底：栅格化后仍然很大的图不按装饰图处理。
+DECORATIVE_REPEAT_PAGES = 3
+DECORATIVE_MAX_SHORT_SIDE_PT = 120
+DECORATIVE_MAX_SHORT_SIDE_PX = 600
+
 
 class PDFParser(BaseParser):
     """
@@ -249,6 +268,7 @@ class PDFParser(BaseParser):
             "pages_processed": 0,
             "images_extracted": 0,
             "images_deduplicated": 0,
+            "images_decorative_dropped": 0,
             "tables_extracted": 0,
             "bookmarks_found": 0,
             "bookmarks_resolved": 0,
@@ -308,8 +328,21 @@ class PDFParser(BaseParser):
                         continue
                     bookmarks_by_page[page].append(bm)
 
+                # EXEPD-228951：图片去重的作用域是**整份文档**，不是单页。
+                # 旧实现把这个集合建在页循环内部，注释还写着 "a header logo repeated across
+                # pages is still kept once per page" —— 于是同一张页眉 logo 在每页都成了
+                # 一条独立图片资产（PRE 现场：page2_img1~page8_img1 逐字节相同、URL 各不相同）。
+                # bbox 去重仍是**页内**语义（同一页多个 XObject 叠在同一位置），不能混在一起。
+                seen_boxes_by_page = set()
+                first_image_by_digest: Dict[bytes, int] = {}
+                image_entries: List[Dict[str, Any]] = []
+                # 该内容出现在**哪些页**：必须在「同内容只留第一条」之前统计，否则页眉 logo
+                # 在第二、三页被去重掉后只剩 1 页，永远判不出模板资产。
+                pages_by_digest: Dict[bytes, set] = defaultdict(set)
+
                 for page_num, page in enumerate(pdf.pages, 1):
                     try:
+                        seen_boxes_by_page = set()
                         # Inject headings before page text
                         page_bookmarks = bookmarks_by_page.get(page_num, [])
                         for bm in page_bookmarks:
@@ -342,12 +375,12 @@ class PDFParser(BaseParser):
                         # page *region* rather than the XObject itself, every one of
                         # them renders to identical bytes. Skip the repeats: bbox
                         # first, which avoids the (expensive) render entirely, then a
-                        # content hash as a backstop. Both sets are per-page, so a
-                        # header logo repeated across pages is still kept once per
-                        # page.
+                        # content hash as a backstop. The bbox set is per-page; the
+                        # content-hash set is per-document (EXEPD-228951), so a header
+                        # logo repeated across pages is kept only once — and small
+                        # repeated template images are dropped entirely after the
+                        # whole document is scanned (see the post-pass below).
                         images = page.images
-                        seen_boxes = set()
-                        seen_digests = set()
                         for img_idx, img in enumerate(images or []):
                             try:
                                 bbox_key = (
@@ -356,21 +389,25 @@ class PDFParser(BaseParser):
                                     round(img["x1"], 1),
                                     round(img["bottom"], 1),
                                 )
-                                if bbox_key in seen_boxes:
+                                if bbox_key in seen_boxes_by_page:
                                     meta["images_deduplicated"] += 1
                                     continue
-                                seen_boxes.add(bbox_key)
+                                seen_boxes_by_page.add(bbox_key)
 
                                 # Extract image using underlying PDF object
                                 image_obj = self._extract_image_from_page(page, img)
                                 if image_obj:
-                                    # Dedup only — md5 keeps this cheap, and the
-                                    # flag keeps it working on FIPS-locked hosts.
-                                    digest = hashlib.md5(image_obj, usedforsecurity=False).digest()
-                                    if digest in seen_digests:
+                                    # sha256 doubles as the identity key and as the
+                                    # content hash handed to downstream, so the
+                                    # knowledge service can dedupe the same bytes even
+                                    # when their URIs differ.
+                                    digest = hashlib.sha256(image_obj).digest()
+                                    pages_by_digest[digest].add(page_num)
+                                    if digest in first_image_by_digest:
                                         meta["images_deduplicated"] += 1
                                         continue
-                                    seen_digests.add(digest)
+
+                                    width, height = self._image_pixel_size(image_obj)
 
                                     # Save image
                                     filename = f"page{page_num}_img{img_idx + 1}"
@@ -380,9 +417,26 @@ class PDFParser(BaseParser):
 
                                     # Generate path relative to the media root.
                                     rel_path = image_path.relative_to(storage.media_dir)
+                                    # ⛔ 前缀 `<!-- Page {n} Image {i}` 不能改：旧正则与旧下游
+                                    # （knowledge-service 的 SnippetText）按它取页码，新字段只是追加。
                                     parts.append(
-                                        f"<!-- Page {page_num} Image {img_idx + 1} -->\n"
+                                        f"<!-- Page {page_num} Image {img_idx + 1}"
+                                        f" w={width} h={height} sha256={digest.hex()} -->\n"
                                         f"![Page {page_num} Image {img_idx + 1}]({rel_path})"
+                                    )
+                                    first_image_by_digest[digest] = len(image_entries)
+                                    image_entries.append(
+                                        {
+                                            "digest": digest,
+                                            "page": page_num,
+                                            "width": width,
+                                            "height": height,
+                                            # 版面尺寸（pt）：与 DPI 无关，装饰图判定的主依据
+                                            "box_width": bbox_key[2] - bbox_key[0],
+                                            "box_height": bbox_key[3] - bbox_key[1],
+                                            "part": len(parts) - 1,
+                                            "path": image_path,
+                                        }
                                     )
                                     meta["images_extracted"] += 1
                             except Exception as img_err:
@@ -392,11 +446,64 @@ class PDFParser(BaseParser):
                     finally:
                         self._release_page_cache(page)
 
+                # EXEPD-228951 post-pass: drop template/decoration images.
+                # A digest that shows up on >= DECORATIVE_REPEAT_PAGES pages *and* whose
+                # shortest side is <= DECORATIVE_MAX_SHORT_SIDE is a header/footer logo,
+                # not content: real photos repeat only when they are the same file, and
+                # such a file is far larger than this threshold.
+                if image_entries:
+                    decorative = {
+                        digest
+                        for digest, pages in pages_by_digest.items()
+                        if len(pages) >= DECORATIVE_REPEAT_PAGES
+                    }
+                    if decorative:
+                        # 版面上与栅格化后都很小，才按模板图处理（两条都要满足）
+                        small_on_page = {
+                            entry["digest"]
+                            for entry in image_entries
+                            if 0 < min(entry["box_width"], entry["box_height"])
+                            <= DECORATIVE_MAX_SHORT_SIDE_PT
+                            and 0 < min(entry["width"], entry["height"])
+                            <= DECORATIVE_MAX_SHORT_SIDE_PX
+                        }
+                        decorative &= small_on_page
+                    if decorative:
+                        kept = 0
+                        for digest in decorative:
+                            # 这些页上的同一张图全部按「模板图剔除」记：先把它之前计入
+                            # images_deduplicated 的重复次数退回去，再按出现页数计剔除，
+                            # 否则同一张 logo 一半算去重、一半算剔除，数字对不上现场。
+                            sightings = len(pages_by_digest[digest])
+                            meta["images_deduplicated"] -= max(0, sightings - 1)
+                            meta["images_decorative_dropped"] += sightings
+                        for entry in image_entries:
+                            if entry["digest"] not in decorative:
+                                kept += 1
+                                continue
+                            parts[entry["part"]] = ""
+                            try:
+                                entry["path"].unlink(missing_ok=True)
+                            except OSError as drop_err:  # pragma: no cover - 存储异常不影响解析
+                                logger.warning(
+                                    f"Failed to delete decorative image {entry['path']}: {drop_err}"
+                                )
+                        meta["images_extracted"] = kept
+                        logger.info(
+                            "Dropped %d template image(s) repeated on %d+ pages "
+                            "(short side <= %dpt and <= %dpx); kept=%d",
+                            meta["images_decorative_dropped"],
+                            DECORATIVE_REPEAT_PAGES,
+                            DECORATIVE_MAX_SHORT_SIDE_PT,
+                            DECORATIVE_MAX_SHORT_SIDE_PX,
+                            kept,
+                        )
+
             if not parts:
                 logger.warning(f"No content extracted from {pdf_path}")
                 return "", meta
 
-            markdown_content = "\n\n".join(parts)
+            markdown_content = "\n\n".join(part for part in parts if part)
             logger.info(
                 f"Local conversion: {meta['pages_processed']}/{meta['total_pages']} pages, "
                 f"{meta['headings_found']} headings ({meta['heading_source']}, "
@@ -680,6 +787,24 @@ class PDFParser(BaseParser):
         except Exception as e:
             logger.debug(f"Image extraction error: {e}")
             return None
+
+    @staticmethod
+    def _image_pixel_size(image_bytes: bytes) -> tuple[int, int]:
+        """PNG 字节 → (width, height)；非 PNG 或不认识时返回 (0, 0)。
+
+        只读 IHDR（签名 8 字节 + 长度/类型 8 字节 + 宽高 8 字节），不依赖 Pillow：
+        这里只要两个整数写进图片注释，多引一个图像库不划算。
+        """
+        if (
+            len(image_bytes) >= 24
+            and image_bytes[:8] == b"\x89PNG\r\n\x1a\n"
+            and image_bytes[12:16] == b"IHDR"
+        ):
+            return (
+                int.from_bytes(image_bytes[16:20], "big"),
+                int.from_bytes(image_bytes[20:24], "big"),
+            )
+        return (0, 0)
 
     async def _convert_mineru(
         self,

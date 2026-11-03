@@ -339,6 +339,11 @@ class PDFParser(BaseParser):
                 # 该内容出现在**哪些页**：必须在「同内容只留第一条」之前统计，否则页眉 logo
                 # 在第二、三页被去重掉后只剩 1 页，永远判不出模板资产。
                 pages_by_digest: Dict[bytes, set] = defaultdict(set)
+                # 每个 digest 的**全部**出现（含后面被内容去重掉的页）：
+                # (版面宽 pt, 版面高 pt, 栅格宽 px, 栅格高 px)。
+                # 装饰图判定必须逐次看尺寸：只看首见那一页会把「先小图、后大图」的真实图误删
+                # （2026-11-03 代码复核 P1）。
+                occurrences_by_digest: Dict[bytes, List[tuple]] = defaultdict(list)
 
                 for page_num, page in enumerate(pdf.pages, 1):
                     try:
@@ -403,11 +408,20 @@ class PDFParser(BaseParser):
                                     # when their URIs differ.
                                     digest = hashlib.sha256(image_obj).digest()
                                     pages_by_digest[digest].add(page_num)
+                                    width, height = self._image_pixel_size(image_obj)
+                                    # 去重只决定「落几个文件」，不决定装饰图判定：同一张图在大版面
+                                    # 与小版面上都出现过时，两次都要留痕，否则小版面那次会替它定罪。
+                                    occurrences_by_digest[digest].append(
+                                        (
+                                            bbox_key[2] - bbox_key[0],
+                                            bbox_key[3] - bbox_key[1],
+                                            width,
+                                            height,
+                                        )
+                                    )
                                     if digest in first_image_by_digest:
                                         meta["images_deduplicated"] += 1
                                         continue
-
-                                    width, height = self._image_pixel_size(image_obj)
 
                                     # Save image
                                     filename = f"page{page_num}_img{img_idx + 1}"
@@ -458,16 +472,20 @@ class PDFParser(BaseParser):
                         if len(pages) >= DECORATIVE_REPEAT_PAGES
                     }
                     if decorative:
-                        # 版面上与栅格化后都很小，才按模板图处理（两条都要满足）
-                        small_on_page = {
-                            entry["digest"]
-                            for entry in image_entries
-                            if 0 < min(entry["box_width"], entry["box_height"])
-                            <= DECORATIVE_MAX_SHORT_SIDE_PT
-                            and 0 < min(entry["width"], entry["height"])
-                            <= DECORATIVE_MAX_SHORT_SIDE_PX
+                        # 版面上与栅格化后都很小，才按模板图处理（两条都要满足）。
+                        # 保守判定：该 digest 的**每一次**出现都必须小 —— 只要有一次是正常版面
+                        # （例如同一枚图标先当行内小图、后当整页大图），整类保留，一个文件都不删。
+                        small_on_every_occurrence = {
+                            digest
+                            for digest, occurrences in occurrences_by_digest.items()
+                            if occurrences
+                            and all(
+                                0 < min(box_w, box_h) <= DECORATIVE_MAX_SHORT_SIDE_PT
+                                and 0 < min(px_w, px_h) <= DECORATIVE_MAX_SHORT_SIDE_PX
+                                for box_w, box_h, px_w, px_h in occurrences
+                            )
                         }
-                        decorative &= small_on_page
+                        decorative &= small_on_every_occurrence
                     if decorative:
                         kept = 0
                         for digest in decorative:

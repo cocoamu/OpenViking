@@ -85,10 +85,10 @@ def _storage() -> MagicMock:
     return storage
 
 
-async def _convert(parser: PDFParser, pages, renders):
+async def _convert(parser: PDFParser, pages, renders, storage=None):
     fake_pdf = SimpleNamespace(pages=pages)
     fake_pdfplumber = SimpleNamespace(open=lambda _path: nullcontext(fake_pdf))
-    storage = _storage()
+    storage = storage or _storage()
     with (
         patch("openviking.parse.parsers.pdf.lazy_import", return_value=fake_pdfplumber),
         patch.object(parser, "_extract_bookmarks", return_value=[]),
@@ -179,3 +179,48 @@ def test_pixel_size_reads_png_header_and_fails_open():
     assert PDFParser._image_pixel_size(_png(116, 116)) == (116, 116)
     assert PDFParser._image_pixel_size(b"not-a-png") == (0, 0)
     assert PDFParser._image_pixel_size(b"") == (0, 0)
+
+def _file_storage(tmp_path: Path) -> MagicMock:
+    """真把图片写到磁盘的 storage，用来核对「被剔除的图是否真的删了 / 保留的图还在」。"""
+    media = tmp_path / "media"
+    storage = MagicMock()
+    storage.media_dir = media
+
+    def save(_resource_name, data, filename=None):
+        path = media / "images" / f"{filename}.png"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        return path
+
+    storage.save_image.side_effect = save
+    return storage
+
+
+@pytest.mark.asyncio
+async def test_mixed_size_occurrences_keep_the_whole_digest(tmp_path):
+    """同一字节先以小版面出现、后以大版面出现 ⇒ 整类保留（2026-11-03 复核 P1）。
+
+    只看首见那次（旧实现）会把这块字节的全部出现判成页眉 logo 并删文件；
+    保守规则要求「每一次出现都小」才剔除。
+    """
+    icon = _png(116, 116)
+    pages = [_FakePage(f"Page {n}") for n in range(1, 4)]
+    pages[0].images = [_bbox(0.0)]  # 100pt 小版面：像页眉
+    pages[1].images = [_bbox(0.0)]  # 100pt 小版面
+    # 第 3 页同一份字节当整页插图用：400pt 版面，远超 DECORATIVE_MAX_SHORT_SIDE_PT
+    pages[2].images = [_bbox(400.0, left=40.0, width=400.0)]
+    renders = {(0.0, 0.0): icon, (40.0, 400.0): icon}
+
+    markdown, meta, storage = await _convert(
+        PDFParser(), pages, renders, storage=_file_storage(tmp_path)
+    )
+
+    assert meta["images_decorative_dropped"] == 0, "有一次大版面就不能判成模板图"
+    assert meta["images_deduplicated"] == 2, "跨页同字节仍按内容去重，只剩首见那次"
+    assert meta["images_extracted"] == 1
+    saved = list((tmp_path / "media" / "images").glob("*.png"))
+    assert len(saved) == 1, "保留下来的图必须还在盘上"
+    assert saved[0].read_bytes() == icon
+    assert markdown.count("![Page") == 1
+    assert markdown.count("<!-- Page 1 Image") == 1
+    assert "w=116 h=116" in markdown

@@ -38,6 +38,7 @@ from openviking.storage.vectordb.collection.collection import Collection
 from openviking.storage.vectordb.collection.result import UpdateResult
 from openviking.storage.vectordb.utils.logging_init import init_cpp_logging
 from openviking.storage.vectordb_adapters import create_collection_adapter
+from openviking_cli.exceptions import UnavailableError
 from openviking.utils.tags import merge_search_tags
 from openviking.utils.time_utils import get_current_timestamp
 from openviking_cli.exceptions import InvalidArgumentError
@@ -200,6 +201,34 @@ class _AsyncVectorAdapter:
                 )
 
         await asyncio.to_thread(_update)
+
+
+# 只重试「连接被对端关掉」这一类传输层错误：换一条池内连接通常立刻恢复。
+# 超时（Timeout/ReadTimeout）刻意不重试——服务端可能已经执行，重试会放大负载和尾延迟。
+_TRANSIENT_TRANSPORT_ERROR_NAMES = frozenset(
+    {
+        "ConnectionError",
+        "RemoteDisconnected",
+        "ProtocolError",
+        "NewConnectionError",
+        "ConnectTimeoutError",
+        "ConnectionResetError",
+        "ConnectionAbortedError",
+        "BrokenPipeError",
+    }
+)
+
+
+def _is_transient_transport_error(exc: BaseException) -> bool:
+    """沿异常链判「是不是连接类故障」，不做类型导入，避免 requests/urllib3 版本差异。"""
+    seen = set()
+    current: Optional[BaseException] = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if type(current).__name__ in _TRANSIENT_TRANSPORT_ERROR_NAMES:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 class _SingleAccountBackend:
@@ -687,37 +716,86 @@ class _SingleAccountBackend:
         output_fields: Optional[List[str]] = None,
         order_by: Optional[str] = None,
         order_desc: bool = False,
+        strict: bool = False,
     ) -> List[Dict[str, Any]]:
-        try:
-            logger.debug(
-                f"[_SingleAccountBackend.query] Called with bound_account_id={self._bound_account_id}, filter={filter}"
-            )
-            if self._bound_account_id:
-                account_filter = Eq("account_id", self._bound_account_id)
-                if filter:
-                    if isinstance(filter, dict):
-                        filter = RawDSL(filter)
-                    filter = And([account_filter, filter])
-                else:
-                    filter = account_filter
-                logger.debug(
-                    f"[_SingleAccountBackend.query] Applied account filter, final filter={filter}"
-                )
+        """按 account 过滤后查向量库。
 
-            return await self._async_adapter.call(
-                "query",
-                query_vector=query_vector,
-                sparse_query_vector=sparse_query_vector,
-                filter=filter,
-                limit=limit,
-                offset=offset,
-                output_fields=output_fields,
-                order_by=order_by,
-                order_desc=order_desc,
+        ``strict`` 只给**只读检索**用（见 ``search()``）：查询真失败时抛 ``UnavailableError``
+        （HTTP 503），而不是返回空列表。默认 ``False`` 保持写入/元数据路径的旧行为——
+        ``filter()`` 承载入库前清理、reindex prune、列目录补 tag，那些路径把异常吞成空
+        比抛出去更安全（否则一次向量库抖动会被放大成入库失败）。
+        """
+        return await self._run_query(
+            query_vector=query_vector,
+            sparse_query_vector=sparse_query_vector,
+            filter=filter,
+            limit=limit,
+            offset=offset,
+            output_fields=output_fields,
+            order_by=order_by,
+            order_desc=order_desc,
+            strict=strict,
+        )
+
+    async def _run_query(
+        self,
+        *,
+        query_vector: Optional[List[float]],
+        sparse_query_vector: Optional[Dict[str, float]],
+        filter: Optional[Dict[str, Any] | FilterExpr],
+        limit: int,
+        offset: int,
+        output_fields: Optional[List[str]],
+        order_by: Optional[str],
+        order_desc: bool,
+        strict: bool,
+    ) -> List[Dict[str, Any]]:
+        logger.debug(
+            f"[_SingleAccountBackend.query] Called with bound_account_id={self._bound_account_id}, filter={filter}"
+        )
+        if self._bound_account_id:
+            account_filter = Eq("account_id", self._bound_account_id)
+            if filter:
+                if isinstance(filter, dict):
+                    filter = RawDSL(filter)
+                filter = And([account_filter, filter])
+            else:
+                filter = account_filter
+            logger.debug(
+                f"[_SingleAccountBackend.query] Applied account filter, final filter={filter}"
             )
-        except Exception as e:
-            logger.error("Error querying collection: %s", e, exc_info=True)
-            return []
+
+        max_attempts = 2 if strict else 1
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return await self._async_adapter.call(
+                    "query",
+                    query_vector=query_vector,
+                    sparse_query_vector=sparse_query_vector,
+                    filter=filter,
+                    limit=limit,
+                    offset=offset,
+                    output_fields=output_fields,
+                    order_by=order_by,
+                    order_desc=order_desc,
+                )
+            except Exception as e:
+                if strict:
+                    # 连接被对端关掉：池里的坏连接已被 urllib3 丢弃，再来一次通常会新建连接成功。
+                    if _is_transient_transport_error(e) and attempt < max_attempts:
+                        logger.warning(
+                            "vector query transient failure (attempt %d/%d), retrying once: %s",
+                            attempt, max_attempts, e,
+                        )
+                        continue
+                    logger.error(
+                        "vector query unavailable after %d attempt(s): %s", attempt, e, exc_info=True
+                    )
+                    raise UnavailableError("vectordb", type(e).__name__) from e
+                logger.error("Error querying collection: %s", e, exc_info=True)
+                return []
+        # 理论上不可达（循环内要么 return 要么 raise）
+        return []
 
     async def search_by_random(
         self,
@@ -756,6 +834,7 @@ class _SingleAccountBackend:
             limit=limit,
             offset=offset,
             output_fields=output_fields,
+            strict=True,
         )
 
     async def filter(

@@ -166,6 +166,11 @@ class PDFConfig(ParserConfig):
     # Image extraction configuration
     image_resolution: int = 300  # Rendering DPI for extracted image regions
 
+    # EXEPD-230092：给 PDF 里抽出的图片补一句内容描述，写进 markdown 的 alt。
+    # 关着的时候行为逐字不变（alt 仍是 "Page N Image M"）。
+    image_caption: bool = False
+    image_caption_max_chars: int = 60
+
     def validate(self) -> None:
         """
         Validate configuration.
@@ -194,6 +199,9 @@ class PDFConfig(ParserConfig):
 
         if self.font_heading_min_delta <= 0:
             raise ValueError("font_heading_min_delta must be positive")
+
+        if self.image_caption_max_chars <= 0:
+            raise ValueError("image_caption_max_chars must be positive")
 
 
 @dataclass

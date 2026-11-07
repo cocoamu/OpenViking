@@ -221,7 +221,66 @@ class PDFParser(BaseParser):
     ) -> tuple[str, Dict[str, Any]]:
         # pdfplumber / pdfminer 的解析与图片/表格提取通常是 CPU/IO 密集且为同步实现，
         # 放到线程池中执行，避免阻塞事件循环。
-        return await asyncio.to_thread(self._convert_local_sync, pdf_path, storage, resource_name)
+        markdown, meta = await asyncio.to_thread(
+            self._convert_local_sync, pdf_path, storage, resource_name
+        )
+        # EXEPD-230092：抽出来的图只有 "Page N Image M" 这种占位描述，下游（知识库检索侧）
+        # 拿不到"这张图画的是什么"，于是模型看不见没有文字说明的实物图。
+        # 这里在解析末尾给每张图补一句内容描述写进 alt；开关关着时逐字不变。
+        if getattr(self.config, "image_caption", False):
+            markdown = await self._caption_images(markdown, storage)
+        return markdown, meta
+
+    async def _caption_images(self, markdown: str, storage) -> str:
+        """把 `![Page N Image M](path)` 的 alt 换成图片内容描述。
+
+        失败（模型没调通、返回空、图读不到）一律保留原 alt —— 补描述是增强，
+        绝不能让入库因为多了一次模型调用而失败。
+        """
+        if not markdown:
+            return markdown
+        try:
+            from openviking.parse.vlm import VLMProcessor
+        except Exception as exc:  # pragma: no cover - 依赖缺失时静默降级
+            logger.warning(f"Image caption skipped (VLM unavailable): {exc}")
+            return markdown
+
+        processor = VLMProcessor()
+        media_dir = getattr(storage, "media_dir", None)
+        if media_dir is None:
+            return markdown
+
+        pattern = re.compile(r"!\[Page (\d+) Image (\d+)\]\(([^)]+)\)")
+        limit = int(getattr(self.config, "image_caption_max_chars", 60))
+
+        async def replace(match: re.Match) -> str:
+            page_no, image_no, rel_path = match.group(1), match.group(2), match.group(3)
+            placeholder = f"Page {page_no} Image {image_no}"
+            try:
+                image_file = Path(media_dir) / rel_path
+                if not image_file.is_file():
+                    return match.group(0)
+                image_bytes = image_file.read_bytes()
+                result = await processor.understand_image(image_bytes)
+                caption = (result.abstract or "").strip()
+                # 模型没识别出来时会给 "[Image]" 这类占位，别写进 alt。
+                if not caption or caption.startswith("["):
+                    return match.group(0)
+                caption = " ".join(caption.split())[:limit]
+                safe_alt = caption.replace("]", " ").replace("[", " ")
+                return f"![{safe_alt}]({rel_path})"
+            except Exception as exc:
+                logger.warning(f"Image caption failed for {placeholder}: {exc}")
+                return match.group(0)
+
+        parts = []
+        cursor = 0
+        for match in pattern.finditer(markdown):
+            parts.append(markdown[cursor : match.start()])
+            parts.append(await replace(match))
+            cursor = match.end()
+        parts.append(markdown[cursor:])
+        return "".join(parts)
 
     def _convert_local_sync(
         self, pdf_path: Path, storage=None, resource_name: Optional[str] = None

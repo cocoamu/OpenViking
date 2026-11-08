@@ -246,6 +246,10 @@ class PDFParser(BaseParser):
             return markdown
 
         processor = VLMProcessor()
+        if storage is None:
+            from openviking_cli.utils.storage import get_storage
+
+            storage = get_storage()
         media_dir = getattr(storage, "media_dir", None)
         if media_dir is None:
             return markdown

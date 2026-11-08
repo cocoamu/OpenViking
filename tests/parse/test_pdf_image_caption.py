@@ -88,3 +88,18 @@ def test_missing_file_keeps_placeholder(media, monkeypatch):
     md = "![Page 3 Image 1](not_there.png)"
     out = asyncio.run(parser._caption_images(md, media))
     assert out == md
+
+
+def test_normal_parse_resolves_default_storage(media, monkeypatch, tmp_path):
+    import openviking.parse.vlm as vlm_module
+    import openviking_cli.utils.storage as storage_module
+
+    fake = _FakeProcessor()
+    monkeypatch.setattr(vlm_module, "VLMProcessor", lambda: fake)
+    monkeypatch.setattr(storage_module, "get_storage", lambda: media)
+    parser = _parser(True)
+    md = "<!-- Page 10 Image 2 -->\n![Page 10 Image 2](page10_img2.png)"
+    monkeypatch.setattr(parser, "_convert_local_sync", lambda *args: (md, {}))
+    out, _ = asyncio.run(parser._convert_to_markdown(tmp_path / "input.pdf"))
+    assert out == "<!-- Page 10 Image 2 -->\n![一排七个罐体，标注 500FP 到 1000FP](page10_img2.png)"
+    assert fake.calls == 1

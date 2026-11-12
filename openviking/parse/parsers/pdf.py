@@ -42,6 +42,21 @@ logger = get_logger(__name__)
 _PDF_RENDER_LOCK = threading.Lock()
 
 
+# EXEPD-230436：扫描件常见「整页底图 + 若干嵌套文字块图」的多层结构。
+# 页面没有文本层时，整页底图已经覆盖该页全部可见像素；再按 XObject 逐块抽图，
+# 等于把同一页切成一批互相重叠的碎片，而块边界不受排版约束——可能正好落在折行中间。
+# 现场（2026-11-11 dev《终端员工奖惩管理办法--签批版.pdf》）：
+#   2.2.2「一次嘉奖…一次小功…一次大功奖励人民币 / 300 元。」被块边界切成两段，
+#   命中的 page1_img4 只到「大功奖励人民币」，模型如实回答「文字截断、读不到金额」。
+# 判定必须**三条件同时成立**，避免误删正常 PDF 的插图：
+#   ① 该页没有可提取文本（纯扫描/整页栅格化）；
+#   ② 某张图覆盖 ≥95% 页面（整页底图）；
+#   ③ 另一张图完全落在它的 bbox 内（只是它上面的重复图层）。
+# 只有同时满足时，被包含的图层才是冗余的；整页底图抽取失败时一律不丢（见调用处）。
+PAGE_COVERING_AREA_RATIO = 0.95
+NESTED_CONTAINMENT_TOLERANCE_PT = 1.0
+
+
 class PDFParser(BaseParser):
     """
     PDF parser with dual conversion strategy.
@@ -303,6 +318,7 @@ class PDFParser(BaseParser):
             "pages_processed": 0,
             "images_extracted": 0,
             "images_deduplicated": 0,
+            "images_nested_dropped": 0,
             "tables_extracted": 0,
             "bookmarks_found": 0,
             "bookmarks_resolved": 0,
@@ -401,11 +417,47 @@ class PDFParser(BaseParser):
                         # content hash as a backstop. Both sets are per-page, so a
                         # header logo repeated across pages is still kept once per
                         # page.
-                        images = page.images
+                        images = page.images or []
+                        # EXEPD-230436：纯扫描页的多层图先归一为「整页底图」一张。
+                        # 只在这一页没有文本层时启用；底图必须先成功抽出来，否则宁可
+                        # 退回旧行为（逐块抽）也不能把整页内容丢掉。
+                        cover_index = None
+                        cover_image = None
+                        cover_bytes = None
+                        if not (text and text.strip()):
+                            cover_index = self._page_covering_image_index(
+                                images,
+                                float(getattr(page, "width", 0) or 0),
+                                float(getattr(page, "height", 0) or 0),
+                            )
+                            if cover_index is not None:
+                                cover_image = images[cover_index]
+                                try:
+                                    cover_bytes = self._extract_image_from_page(page, cover_image)
+                                except Exception as cover_err:
+                                    cover_bytes = None
+                                    logger.warning(
+                                        f"Failed to extract page-covering image {cover_index + 1} "
+                                        f"on page {page_num}: {cover_err}"
+                                    )
+                                if not cover_bytes:
+                                    # 底图抽不出来 ⇒ 不启用嵌套剔除，逐块照旧
+                                    cover_index, cover_image = None, None
+                        else:
+                            cover_bytes = None
                         seen_boxes = set()
                         seen_digests = set()
-                        for img_idx, img in enumerate(images or []):
+                        for img_idx, img in enumerate(images):
                             try:
+                                # 被整页底图完全包含的图层（同一页的重复栅格）不再单独出图：
+                                # 底图已包含它的全部像素，单独抽只会多出一条「半句话」证据。
+                                if (
+                                    cover_image is not None
+                                    and img_idx != cover_index
+                                    and self._is_nested_image(img, cover_image)
+                                ):
+                                    meta["images_nested_dropped"] += 1
+                                    continue
                                 bbox_key = (
                                     round(img["x0"], 1),
                                     round(img["top"], 1),
@@ -418,7 +470,11 @@ class PDFParser(BaseParser):
                                 seen_boxes.add(bbox_key)
 
                                 # Extract image using underlying PDF object
-                                image_obj = self._extract_image_from_page(page, img)
+                                image_obj = (
+                                    cover_bytes
+                                    if img_idx == cover_index and cover_bytes
+                                    else self._extract_image_from_page(page, img)
+                                )
                                 if image_obj:
                                     # Dedup only — md5 keeps this cheap, and the
                                     # flag keeps it working on FIPS-locked hosts.
@@ -459,7 +515,8 @@ class PDFParser(BaseParser):
                 f"bookmarks={meta['bookmarks_found']}, "
                 f"resolved={meta['bookmarks_resolved']}), "
                 f"{meta['images_extracted']} images "
-                f"({meta['images_deduplicated']} duplicates skipped), "
+                f"({meta['images_deduplicated']} duplicates skipped, "
+                f"{meta['images_nested_dropped']} nested layers skipped), "
                 f"{meta['tables_extracted']} tables → "
                 f"{len(markdown_content)} chars"
             )
@@ -702,6 +759,41 @@ class PDFParser(BaseParser):
         except Exception as e:
             logger.warning(f"Failed to detect headings by font: {e}")
             return []
+
+    @staticmethod
+    def _page_covering_image_index(
+        images: List[Dict[str, Any]], page_width: float, page_height: float
+    ) -> Optional[int]:
+        """返回覆盖整页的底图下标；没有则 None。
+
+        「整页」按面积比判定（≥ ``PAGE_COVERING_AREA_RATIO``），不要求 bbox 完全等于页面：
+        扫描件底图常带 1pt 以内的越界（现场 bbox top=-0.7）。多张候选时取面积最大的一张。
+        """
+        if not images or page_width <= 0 or page_height <= 0:
+            return None
+        page_area = page_width * page_height
+        best_index = None
+        best_area = 0.0
+        for index, img in enumerate(images):
+            width = img["x1"] - img["x0"]
+            height = img["bottom"] - img["top"]
+            if width <= 0 or height <= 0:
+                continue
+            area = width * height
+            if area / page_area >= PAGE_COVERING_AREA_RATIO and area > best_area:
+                best_index, best_area = index, area
+        return best_index
+
+    @staticmethod
+    def _is_nested_image(img: Dict[str, Any], cover: Dict[str, Any]) -> bool:
+        """img 的 bbox 是否完全落在 cover 内（容差 ``NESTED_CONTAINMENT_TOLERANCE_PT``）。"""
+        tolerance = NESTED_CONTAINMENT_TOLERANCE_PT
+        return (
+            img["x0"] >= cover["x0"] - tolerance
+            and img["top"] >= cover["top"] - tolerance
+            and img["x1"] <= cover["x1"] + tolerance
+            and img["bottom"] <= cover["bottom"] + tolerance
+        )
 
     def _extract_image_from_page(self, page, img_info: dict) -> Optional[bytes]:
         """

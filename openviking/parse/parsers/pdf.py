@@ -254,9 +254,11 @@ class PDFParser(BaseParser):
 
         pattern = re.compile(r"!\[Page (\d+) Image (\d+)\]\(([^)]+)\)")
         limit = int(getattr(self.config, "image_caption_max_chars", 200))
-        # 单篇预算：最多 60 张、总耗时 8 分钟；超时/失败保留原 alt，避免拖垮入库。
-        max_images = 60
-        deadline = time.monotonic() + 480
+        # 单篇预算（2026-11-13）：按文档实际图数给，封顶 200 张；短文档不浪费额度。
+        # 原硬编码 60 张会让长文档（如 418 张图的 PDF）后 358 张永远拿不到图注。
+        caption_cap = 200
+        max_images = min(len(pattern.findall(markdown)), caption_cap)
+        deadline = time.monotonic() + max(480, max_images * 8)
         captioned = 0
         failures = 0
 

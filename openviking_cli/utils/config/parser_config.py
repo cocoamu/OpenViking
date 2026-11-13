@@ -175,6 +175,10 @@ class PDFConfig(ParserConfig):
     # Image extraction configuration
     image_resolution: int = 300  # Rendering DPI for extracted image regions
 
+    # EXEPD-230261：抽出的图片是否用视觉模型补「名称+含义」式 alt。
+    image_caption: bool = False
+    image_caption_max_chars: int = 200
+
     def validate(self) -> None:
         """
         Validate configuration.

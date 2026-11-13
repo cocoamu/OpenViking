@@ -221,6 +221,104 @@ class PDFParser(BaseParser):
         else:
             raise ValueError(f"Unknown strategy: {self.config.strategy}")
 
+    # EXEPD-230261（pre 回填）：图注必须是「名称 + 含义」，并把同页正文作为 context。
+    _CAPTION_INSTRUCTION = (
+        "这是知识文档中的一张小图。请用不超过 20 个字给出它的名称与含义，"
+        "并写在 abstract 的最开头；名称优先采用 Surrounding Text Context 里出现的说法"
+        "（例如「不可水洗」「最高洗涤30℃」「悬挂滴干」）。"
+        "图里若标有数字或字母（如 30、40、110℃），必须原样写进 abstract。"
+    )
+
+    async def _caption_images(self, markdown: str, storage) -> str:
+        """把 `![Page N Image M](path)` 的 alt 换成「名称 + 含义」式的图片描述。
+
+        由 PDFConfig.image_caption 控制；失败（模型没调通、返回空、图读不到）
+        一律保留原 alt，不能让入库失败。
+        """
+        if not markdown:
+            return markdown
+        try:
+            from openviking.parse.vlm import VLMProcessor
+        except Exception as exc:  # pragma: no cover
+            logger.warning(f"Image caption skipped (VLM unavailable): {exc}")
+            return markdown
+
+        processor = VLMProcessor()
+        if storage is None:
+            from openviking_cli.utils.storage import get_storage
+
+            storage = get_storage()
+        media_dir = getattr(storage, "media_dir", None)
+        if media_dir is None:
+            return markdown
+
+        pattern = re.compile(r"!\[Page (\d+) Image (\d+)\]\(([^)]+)\)")
+        limit = int(getattr(self.config, "image_caption_max_chars", 200))
+        # 单篇预算（2026-11-13）：按文档实际图数给，封顶 200 张；短文档不浪费额度。
+        # 原硬编码 60 张会让长文档（如 418 张图的 PDF）后 358 张永远拿不到图注。
+        caption_cap = 200
+        max_images = min(len(pattern.findall(markdown)), caption_cap)
+        deadline = time.monotonic() + max(480, max_images * 8)
+        captioned = 0
+        failures = 0
+
+        async def replace(match: re.Match) -> str:
+            nonlocal captioned, failures
+            page_no, image_no, rel_path = match.group(1), match.group(2), match.group(3)
+            placeholder = f"Page {page_no} Image {image_no}"
+            if captioned + failures >= max_images or time.monotonic() > deadline:
+                return match.group(0)
+            try:
+                image_file = Path(media_dir) / rel_path
+                if not image_file.is_file():
+                    return match.group(0)
+                image_bytes = image_file.read_bytes()
+                result = await asyncio.wait_for(
+                    processor.understand_image(
+                        image_bytes,
+                        context=self._page_text_context(markdown, page_no),
+                        instruction=self._CAPTION_INSTRUCTION,
+                    ),
+                    timeout=20,
+                )
+                caption = (result.abstract or "").strip()
+                if not caption or caption.startswith("["):
+                    return match.group(0)
+                caption = " ".join(caption.split())[:limit]
+                safe_alt = caption.replace("]", " ").replace("[", " ")
+                captioned += 1
+                return f"![{safe_alt}]({rel_path})"
+            except Exception as exc:
+                failures += 1
+                logger.warning(f"Image caption failed for {placeholder}: {exc}")
+                return match.group(0)
+
+        parts = []
+        cursor = 0
+        for match in pattern.finditer(markdown):
+            parts.append(markdown[cursor : match.start()])
+            parts.append(await replace(match))
+            cursor = match.end()
+        parts.append(markdown[cursor:])
+        logger.info(f"EXEPD-230261 image caption: {captioned} image(s) captioned")
+        return "".join(parts)
+
+    _PAGE_BLOCK = re.compile(r"<!--\s*Page\s+(\d+)[^>]*-->")
+
+    def _page_text_context(self, markdown: str, page_no: str, limit: int = 500) -> str:
+        if not markdown:
+            return ""
+        blocks = list(self._PAGE_BLOCK.finditer(markdown))
+        for index, block in enumerate(blocks):
+            if block.group(1) != str(page_no):
+                continue
+            end = blocks[index + 1].start() if index + 1 < len(blocks) else len(markdown)
+            text = markdown[block.end() : end]
+            text = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", text)
+            text = re.sub(r"<!--.*?-->", " ", text, flags=re.S)
+            return " ".join(text.split())[:limit]
+        return ""
+
     async def _convert_local(
         self, pdf_path: Path, storage=None, resource_name: Optional[str] = None
     ) -> tuple[str, Dict[str, Any]]:
@@ -241,10 +339,18 @@ class PDFParser(BaseParser):
                         "max_heading_levels", "image_resolution",
                     )},
                 )
-                return result["markdown"], result["meta"]
+                markdown = result["markdown"]
+                if getattr(self.config, "image_caption", False):
+                    markdown = await self._caption_images(markdown, worker_storage)
+                return markdown, result["meta"]
         # pdfplumber / pdfminer 的解析与图片/表格提取通常是 CPU/IO 密集且为同步实现，
         # 放到线程池中执行，避免阻塞事件循环。
-        return await asyncio.to_thread(self._convert_local_with_reclaim, pdf_path, storage, resource_name)
+        markdown, meta = await asyncio.to_thread(
+            self._convert_local_with_reclaim, pdf_path, storage, resource_name
+        )
+        if getattr(self.config, "image_caption", False):
+            markdown = await self._caption_images(markdown, storage)
+        return markdown, meta
 
     def _convert_local_with_reclaim(
         self, pdf_path: Path, storage=None, resource_name: Optional[str] = None

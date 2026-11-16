@@ -29,9 +29,13 @@ class _FakeProcessor:
     def __init__(self, abstract: str = "一排七个罐体，标注 500FP 到 1000FP"):
         self.abstract = abstract
         self.calls = 0
+        self.last_context = ""
+        self.last_instruction = ""
 
-    async def understand_image(self, image, context=""):
+    async def understand_image(self, image, context="", instruction=""):
         self.calls += 1
+        self.last_context = context
+        self.last_instruction = instruction
         return _FakeResult(self.abstract)
 
 
@@ -103,3 +107,36 @@ def test_normal_parse_resolves_default_storage(media, monkeypatch, tmp_path):
     out, _ = asyncio.run(parser._convert_to_markdown(tmp_path / "input.pdf"))
     assert out == "<!-- Page 10 Image 2 -->\n![一排七个罐体，标注 500FP 到 1000FP](page10_img2.png)"
     assert fake.calls == 1
+
+
+def test_caption_is_grounded_in_same_page_text(media, monkeypatch):
+    """EXEPD-230261：图注要带上同页正文里的说法，模型才知道叉号是「不可水洗」。"""
+    import openviking.parse.vlm as vlm_module
+
+    fake = _FakeProcessor("不可水洗——水洗槽打叉")
+    monkeypatch.setattr(vlm_module, "VLMProcessor", lambda *a, **k: fake)
+
+    parser = _parser(True)
+    md = (
+        "<!-- Page 81 Table 1 -->\n"
+        "| 洗涤标识认知 | 水洗 | 不可水洗 | 最高洗涤30℃ | 最高洗涤40℃ |\n"
+        "<!-- Page 81 Image 2 -->\n"
+        "![Page 81 Image 2](page10_img2.png)"
+    )
+    out = asyncio.run(parser._caption_images(md, media))
+
+    assert "![不可水洗——水洗槽打叉]" in out, out
+    assert "不可水洗" in fake.last_context, "同页正文必须作为图注上下文：" + fake.last_context
+    assert "名称" in fake.last_instruction, "要显式要求先给名称：" + fake.last_instruction
+
+
+def test_page_text_context_stops_at_next_page(media):
+    parser = _parser(True)
+    md = (
+        "<!-- Page 1 -->\n第一页正文：悬挂滴干\n"
+        "<!-- Page 2 -->\n第二页正文：不可熨烫\n"
+        "![Page 1 Image 1](page10_img2.png)"
+    )
+    ctx = parser._page_text_context(md, "1")
+    assert "悬挂滴干" in ctx
+    assert "不可熨烫" not in ctx, "不能把下一页的正文串进来：" + ctx

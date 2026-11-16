@@ -29,6 +29,7 @@ from openviking.parse.base import (
     create_parse_result,
     lazy_import,
 )
+from openviking.parse.image_metadata import describe_image, format_comment, markdown_with_comment
 from openviking.parse.parsers.base_parser import BaseParser
 from openviking.utils.time_utils import parse_iso_datetime
 from openviking_cli.utils import get_logger
@@ -442,9 +443,17 @@ class PDFParser(BaseParser):
 
                                     # Generate path relative to the media root.
                                     rel_path = image_path.relative_to(storage.media_dir)
+                                    # EXEPD-230545：图片内容身份与宽高统一由 image_metadata 产出，
+                                    # 与 AnyDoc 解析器共用同一契约（下游只认这一种注释）。
                                     parts.append(
-                                        f"<!-- Page {page_num} Image {img_idx + 1} -->\n"
-                                        f"![Page {page_num} Image {img_idx + 1}]({rel_path})"
+                                        markdown_with_comment(
+                                            format_comment(
+                                                describe_image(image_obj),
+                                                page=page_num,
+                                                index=img_idx + 1,
+                                            ),
+                                            f"![Page {page_num} Image {img_idx + 1}]({rel_path})",
+                                        )
                                     )
                                     meta["images_extracted"] += 1
                             except Exception as img_err:

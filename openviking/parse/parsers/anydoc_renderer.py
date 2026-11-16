@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator
 
 from openviking.parse.image_validation import is_valid_image
+from openviking.parse.image_metadata import ImageMetadata, describe_image, format_comment, markdown_with_comment
 from openviking_cli.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -81,6 +82,7 @@ class _AnyDocMarkdownRenderer:
         self.max_table_rows = max_table_rows
         self.images_saved = 0
         self.asset_paths: dict[int, str | None] = {}
+        self.asset_meta: dict[int, ImageMetadata] = {}
         self.assets_referenced: set[int] = set()
         self.warnings: list[str] = []
         self.assets = self._collect_assets()
@@ -328,7 +330,15 @@ class _AnyDocMarkdownRenderer:
         image_ref = self._materialize_asset(reference)
         if image_ref is None:
             return self._escape_text(alt, context=context, in_label=in_label)
-        return f"![{escaped_alt or f'anydoc_asset_{reference}'}]({self._format_url(image_ref)})"
+        markdown = f"![{escaped_alt or f'anydoc_asset_{reference}'}]({self._format_url(image_ref)})"
+        # EXEPD-230545：Office 文档的图片必须带内容身份（sha256 + 宽高），否则下游只能按
+        # URI 去重、跨文档同图识别不出来。只在块级、非链接文本里写注释：heading/表格单元格
+        # 内的链接不能插入块级注释。
+        if context == "block" and not in_label:
+            meta = self.asset_meta.get(reference)
+            if meta is not None:
+                return markdown_with_comment(format_comment(meta), markdown)
+        return markdown
 
     def _materialize_asset(self, reference: int) -> str | None:
         if reference in self.asset_paths:
@@ -354,6 +364,8 @@ class _AnyDocMarkdownRenderer:
             )
             self.asset_paths[reference] = None
             return None
+        # 与落盘字节同源计算：下游下载后可以逐字节核对。
+        self.asset_meta[reference] = describe_image(image_bytes)
 
         try:
             saved_path = self.storage.save_image(

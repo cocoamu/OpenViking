@@ -179,6 +179,11 @@ class PDFConfig(ParserConfig):
     # 关着的时候行为逐字不变（alt 仍是 "Page N Image M"）。
     image_caption: bool = False
     image_caption_max_chars: int = 60
+    # EXEPD-230261：复用已有语义 alt / 相同图片内容的摘要，不重复调用 VLM。
+    # 语义是「有可读摘要就直接用」，不是「跳过图注流程」；两条解析路径共用。
+    image_caption_reuse_summary: bool = True
+    # 单次 VLM 尝试的上界（秒）。空/占位/超时最多再试一次，之后走同页文本兜底。
+    image_caption_timeout: float = 30.0
 
     def validate(self) -> None:
         """
@@ -211,6 +216,9 @@ class PDFConfig(ParserConfig):
 
         if self.image_caption_max_chars <= 0:
             raise ValueError("image_caption_max_chars must be positive")
+
+        if self.image_caption_timeout <= 0:
+            raise ValueError("image_caption_timeout must be positive")
 
 
 @dataclass

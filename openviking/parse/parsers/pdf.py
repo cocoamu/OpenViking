@@ -20,6 +20,7 @@ import re
 import threading
 import time
 from collections import Counter, defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -55,6 +56,189 @@ _PDF_RENDER_LOCK = threading.Lock()
 # 只有同时满足时，被包含的图层才是冗余的；整页底图抽取失败时一律不丢（见调用处）。
 PAGE_COVERING_AREA_RATIO = 0.95
 NESTED_CONTAINMENT_TOLERANCE_PT = 1.0
+
+
+# ── EXEPD-230261 图片 alt 契约 ──────────────────────────────────────────────
+# 凡是进入入库 markdown 的图片引用，alt 必须是可读语义：
+#   非空、非 "Page N Image M"、非 "[Image]"、非纯文档名/文件名/哈希。
+# 唯一的例外是「同页无任何文本线索且 VLM 也失败」的图：保留占位，但必须计入
+# ImageCaptionReport.uncaptioned 并以聚合 WARNING 暴露，不能静默漏掉。
+_IMAGE_REF_RE = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
+_PAGE_MARKER_RE = re.compile(r"<!--\s*Page\s+(\d+)\s*-->")
+_IMAGE_MARKER_RE = re.compile(r"<!--\s*Page\s+(\d+)\s+Image\s+(\d+)\s*-->")
+_HEADING_LINE_RE = re.compile(r"(?m)^(#{1,6})\s+(.+?)\s*$")
+# 契约第 2 条：只认 "Page N Image M" 这一种机读占位；裸 "Page N" 同样是占位。
+_PLACEHOLDER_CAPTION_RE = re.compile(r"^page\s*\d+(?:\s*image\s*\d+)?$", re.IGNORECASE)
+# 契约第 3 条：占位族（大小写不敏感）。
+_PLACEHOLDER_CAPTION_TOKENS = frozenset(
+    {"[image]", "[图片]", "图片", "image", "undefined", "null", "n/a"}
+)
+# 契约第 4 条：图片文件名形态（pageN_imgM[.ext]）。
+_IMAGE_FILENAME_RE = re.compile(r"^page\d+[_-]?img\d+(?:\.[a-z0-9]{1,5})?$", re.IGNORECASE)
+_IMAGE_SUFFIXES = (
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".bmp",
+    ".tif",
+    ".tiff",
+    ".svg",
+)
+# 契约第 1 条：超过 120 字符先截断再判定（与交付侧一致）。
+_CAPTION_MAX_CHARS = 120
+# 兜底形状 "<线索>（图 N）" 至少需要 8 个字符，配置值在运行时收敛到这个区间。
+_CAPTION_MIN_CHARS = 8
+
+
+def _normalize_alt(value: Any) -> str:
+    # 契约只要求 strip；内部空白由正则的 \s* 处理，避免与交付侧长度口径漂移。
+    return str(value or "").strip()
+
+
+def _normalize_name(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    return re.sub(r"[\s_\-—–·,，.。()（）\[\]【】<>《》'\"`]+", "", Path(raw).stem).lower()
+
+
+def is_semantic_caption(value: Any, document_name: str = "", image_name: str = "") -> bool:
+    """EXEPD-230261 语义 alt 契约（引擎侧唯一实现，交付侧按同一套规则核对）。
+
+    判定为真当且仅当同时满足：
+    1. 字符串 strip 后长度 2..120（超长先截断再判定）；
+    2. 不匹配 `^page\\s*\\d+\\s*image\\s*\\d+$`（大小写不敏感；裸 Page N 也视作占位）；
+    3. 不属于占位族 `[Image]` / `[图片]` / `图片` / `image` / `undefined` / `null` / `N/A`；
+    4. 不等于文档名（含去扩展名形式）、图片文件名（pageN_imgM[.ext]）或哈希；
+    5. 不是纯数字/纯符号（`40`、`→`、单字符 `W` 都不算语义）。
+    """
+    if not isinstance(value, str):
+        return False
+    text = _normalize_alt(value)
+    if len(text) > _CAPTION_MAX_CHARS:
+        text = text[:_CAPTION_MAX_CHARS].strip()
+    if not 2 <= len(text) <= _CAPTION_MAX_CHARS:
+        return False
+
+    lowered = text.lower()
+    if _PLACEHOLDER_CAPTION_RE.match(text) or lowered in _PLACEHOLDER_CAPTION_TOKENS:
+        return False
+    if document_name and _normalize_name(text) == _normalize_name(document_name):
+        return False
+    if image_name and _normalize_name(text) == _normalize_name(image_name):
+        return False
+    if _IMAGE_FILENAME_RE.match(text) or lowered.endswith(_IMAGE_SUFFIXES):
+        return False
+    if re.fullmatch(r"[0-9a-f]{16,}", lowered):
+        return False
+
+    # 纯数字（含 40、40.5、40%）或纯符号不算语义；"30℃" 这类数字+符号仍可接受。
+    if re.fullmatch(r"[\d\s.,%‰+\-]+", text):
+        return False
+    if not any(ch.isalnum() or "\u4e00" <= ch <= "\u9fff" for ch in text):
+        return False
+    return True
+
+
+# 兼容旧调用名；实现保持唯一，避免两套判定漂移。
+is_semantic_image_alt = is_semantic_caption
+
+
+def _clean_caption(value: Any, limit: int) -> str:
+    text = " ".join(str(value or "").split())
+    text = text.replace("[", " ").replace("]", " ")
+    return " ".join(text.split())[:limit].strip()
+
+
+@dataclass
+class ImageAltAudit:
+    """对一段 markdown 的图片 alt 做契约审计。"""
+
+    total: int = 0
+    semantic: int = 0
+    invalid: List[str] = field(default_factory=list)
+
+    @property
+    def valid(self) -> bool:
+        return not self.invalid
+
+    @property
+    def uncaptioned(self) -> int:
+        return len(self.invalid)
+
+
+def audit_image_alts(markdown: str, document_name: str = "") -> ImageAltAudit:
+    audit = ImageAltAudit()
+    for match in _IMAGE_REF_RE.finditer(markdown or ""):
+        audit.total += 1
+        image_name = match.group(2).split(None, 1)[0].strip()
+        if is_semantic_caption(match.group(1), document_name, image_name):
+            audit.semantic += 1
+        else:
+            audit.invalid.append(match.group(0))
+    return audit
+
+
+class ImageCaptionInvariantError(AssertionError):
+    """图片 alt 契约或计数不变量被破坏。"""
+
+
+def assert_semantic_image_alts(markdown: str, document_name: str = "") -> None:
+    """测试/验收用断言：所有图片 alt 都必须是可读语义。"""
+    audit = audit_image_alts(markdown, document_name)
+    if audit.invalid:
+        preview = ", ".join(audit.invalid[:3])
+        raise ImageCaptionInvariantError(
+            f"{len(audit.invalid)}/{audit.total} image alt(s) are not semantic: {preview}"
+        )
+
+
+@dataclass
+class ImageCaptionReport:
+    """一次图注补齐的计数与不变量。"""
+
+    images_total: int = 0
+    captioned: int = 0
+    fallback: int = 0
+    reused: int = 0
+    uncaptioned: int = 0
+    vlm_calls: int = 0
+    vlm_retries: int = 0
+    errors: int = 0
+    uncaptioned_samples: List[str] = field(default_factory=list)
+
+    def problems(self) -> List[str]:
+        accounted = self.captioned + self.fallback + self.reused + self.uncaptioned
+        problems = []
+        if accounted != self.images_total:
+            problems.append(
+                f"images_total({self.images_total}) != captioned({self.captioned}) + "
+                f"fallback({self.fallback}) + reused({self.reused}) + "
+                f"uncaptioned({self.uncaptioned})"
+            )
+        if self.vlm_retries > self.vlm_calls:
+            problems.append("vlm_retries cannot exceed vlm_calls")
+        return problems
+
+    def assert_valid(self) -> None:
+        problems = self.problems()
+        if problems:
+            raise ImageCaptionInvariantError("; ".join(problems))
+
+    def to_meta(self) -> Dict[str, Any]:
+        return {
+            "images_total": self.images_total,
+            "captioned": self.captioned,
+            "fallback": self.fallback,
+            "reused": self.reused,
+            "uncaptioned": self.uncaptioned,
+            "vlm_calls": self.vlm_calls,
+            "vlm_retries": self.vlm_retries,
+            "errors": self.errors,
+            "uncaptioned_samples": list(self.uncaptioned_samples),
+        }
 
 
 class PDFParser(BaseParser):
@@ -257,19 +441,29 @@ class PDFParser(BaseParser):
                     )},
                 )
                 markdown = result["markdown"]
-                if getattr(self.config, "image_caption", False):
-                    markdown = await self._caption_images(markdown, worker_storage)
-                return markdown, result["meta"]
+                meta = result["meta"]
+                # 开关只在 _caption_images 内部判断，隔离路径也必须走同一入口。
+                markdown = await self._caption_images(
+                    markdown,
+                    worker_storage,
+                    meta=meta,
+                    document_name=resource_name or pdf_path.stem,
+                )
+                return markdown, meta
         # pdfplumber / pdfminer 的解析与图片/表格提取通常是 CPU/IO 密集且为同步实现，
         # 放到线程池中执行，避免阻塞事件循环。
         markdown, meta = await asyncio.to_thread(
             self._convert_local_with_reclaim, pdf_path, storage, resource_name
         )
-        # EXEPD-230092：抽出来的图只有 "Page N Image M" 这种占位描述，下游（知识库检索侧）
+        # EXEPD-230092/230261：抽出来的图只有 "Page N Image M" 这种占位描述，下游（知识库检索侧）
         # 拿不到"这张图画的是什么"，于是模型看不见没有文字说明的实物图。
         # 这里在解析末尾给每张图补一句内容描述写进 alt；开关关着时逐字不变。
-        if getattr(self.config, "image_caption", False):
-            markdown = await self._caption_images(markdown, storage)
+        markdown = await self._caption_images(
+            markdown,
+            storage,
+            meta=meta,
+            document_name=resource_name or pdf_path.stem,
+        )
         return markdown, meta
 
     def _convert_local_with_reclaim(
@@ -312,80 +506,372 @@ class PDFParser(BaseParser):
         "（例如「不可水洗」「最高洗涤30℃」「悬挂滴干」）。"
         "图里若标有数字或字母（如 30、40、110℃），必须原样写进 abstract。"
     )
+    # 只在首轮返回空/[Image] 时使用一次；不做无界重试。
+    _CAPTION_RETRY_INSTRUCTION = (
+        "再仔细看这张图。只输出图中可直接看到的名称或文字，不超过 20 个字；"
+        "不要输出 [Image]、空内容或解释；确实无法识别时只输出一个空行。"
+    )
 
-    async def _caption_images(self, markdown: str, storage) -> str:
-        """把 `![Page N Image M](path)` 的 alt 换成图片内容描述。
+    async def _caption_images(
+        self,
+        markdown: str,
+        storage,
+        *,
+        meta: Optional[Dict[str, Any]] = None,
+        document_name: str = "",
+    ) -> str:
+        """给 markdown 里的每张图补可读 alt，并把计数写进解析 meta。
 
-        失败（模型没调通、返回空、图读不到）一律保留原 alt —— 补描述是增强，
-        绝不能让入库因为多了一次模型调用而失败。
+        开关只在这里判断，`_convert_local` 的隔离/非隔离两条路径都走同一个入口，
+        避免某条路径绕过 `image_caption` / `image_caption_reuse_summary`。
+        补描述是增强：任何失败都不能让入库失败，最差也保留原引用并计入
+        `uncaptioned`，由调用方把问题暴露出去。
         """
-        if not markdown:
+        if not getattr(getattr(self, "config", None), "image_caption", False):
             return markdown
         try:
-            from openviking.parse.vlm import VLMProcessor
-        except Exception as exc:  # pragma: no cover - 依赖缺失时静默降级
-            logger.warning(f"Image caption skipped (VLM unavailable): {exc}")
+            markdown, report = await self._caption_images_with_report(
+                markdown, storage, document_name=document_name
+            )
+        except Exception as exc:
+            # 最后一道保险：图注流程自身的意外不能把整篇解析拖失败。
+            logger.warning("Image caption pass failed; keeping original markdown: %s", exc)
+            if meta is not None:
+                meta.setdefault("images_total", 0)
+                meta["caption_error"] = str(exc)[:200]
             return markdown
+        if meta is not None:
+            meta.update(report.to_meta())
+        return markdown
 
-        processor = VLMProcessor()
+    async def _caption_images_with_report(
+        self, markdown: str, storage, *, document_name: str = ""
+    ) -> tuple[str, ImageCaptionReport]:
+        """分层生成图注：已有摘要复用 → VLM（最多两轮）→ 同页线索兜底 → 计数保留。
+
+        计数口径（不变量）：
+            images_total == captioned + fallback + reused + uncaptioned
+        - captioned：本次 VLM 新产出的语义 alt（首轮或一次重试成功）
+        - fallback：VLM 未产出时，用最近章节标题/同页首句生成的可追溯 alt
+        - reused：已有语义 alt 或相同图片内容已产出的摘要，未重复调用 VLM
+        - uncaptioned：既无同页线索、VLM 也失败，保留占位（必须可见）
+        """
+        report = ImageCaptionReport()
+        if not markdown:
+            return markdown, report
+
         if storage is None:
-            from openviking_cli.utils.storage import get_storage
-
-            storage = get_storage()
-        media_dir = getattr(storage, "media_dir", None)
-        if media_dir is None:
-            return markdown
-
-        pattern = re.compile(r"!\[Page (\d+) Image (\d+)\]\(([^)]+)\)")
-        limit = int(getattr(self.config, "image_caption_max_chars", 60))
-
-        async def replace(match: re.Match) -> str:
-            page_no, image_no, rel_path = match.group(1), match.group(2), match.group(3)
-            placeholder = f"Page {page_no} Image {image_no}"
             try:
-                image_file = Path(media_dir) / rel_path
-                if not image_file.is_file():
-                    return match.group(0)
-                image_bytes = image_file.read_bytes()
-                result = await processor.understand_image(
-                    image_bytes,
-                    context=self._page_text_context(markdown, page_no),
-                    instruction=self._CAPTION_INSTRUCTION,
-                )
-                caption = (result.abstract or "").strip()
-                # 模型没识别出来时会给 "[Image]" 这类占位，别写进 alt。
-                if not caption or caption.startswith("["):
-                    return match.group(0)
-                caption = " ".join(caption.split())[:limit]
-                safe_alt = caption.replace("]", " ").replace("[", " ")
-                return f"![{safe_alt}]({rel_path})"
-            except Exception as exc:
-                logger.warning(f"Image caption failed for {placeholder}: {exc}")
-                return match.group(0)
+                from openviking_cli.utils.storage import get_storage
 
-        parts = []
+                storage = get_storage()
+            except Exception as exc:  # pragma: no cover - 默认存储不可用时仍可兜底
+                logger.warning("Image caption storage unavailable: %s", exc)
+                storage = None
+        media_dir = getattr(storage, "media_dir", None)
+
+        processor = None
+        try:
+            from openviking.parse.vlm import VLMProcessor
+
+            processor = VLMProcessor()
+        except Exception as exc:  # pragma: no cover - 依赖缺失时降级到文本兜底
+            logger.warning("Image caption VLM unavailable; using page-text fallback: %s", exc)
+
+        limit = int(getattr(self.config, "image_caption_max_chars", 60))
+        limit = min(max(limit, _CAPTION_MIN_CHARS), _CAPTION_MAX_CHARS)
+        reuse = bool(getattr(self.config, "image_caption_reuse_summary", True))
+        timeout = float(getattr(self.config, "image_caption_timeout", 30.0))
+
+        matches = list(_IMAGE_REF_RE.finditer(markdown))
+        report.images_total = len(matches)
+        if not matches:
+            return markdown, report
+
+        # 同一次解析内的复用：相同图片字节只问一次 VLM；同页上下文只算一次。
+        caption_cache: Dict[str, str] = {}
+        failed_digests: set[str] = set()
+        page_contexts: Dict[str, str] = {}
+        page_bodies: Dict[str, str] = {}
+        parts: List[str] = []
         cursor = 0
-        for match in pattern.finditer(markdown):
+
+        for index, match in enumerate(matches, start=1):
             parts.append(markdown[cursor : match.start()])
-            parts.append(await replace(match))
             cursor = match.end()
+            raw_alt = match.group(1)
+            raw_target = match.group(2)
+            target = raw_target.split(None, 1)[0].strip()
+            page_no, image_no = self._locate_image(markdown, match, index)
+            existing_semantic = is_semantic_caption(raw_alt, document_name, target)
+
+            # 第 1 层：已有语义 alt 直接复用，不重复调 VLM。
+            if existing_semantic and reuse:
+                report.reused += 1
+                parts.append(match.group(0))
+                continue
+
+            replacement = ""
+            image_bytes = None
+            if media_dir is not None:
+                try:
+                    image_file = Path(media_dir) / target
+                    if image_file.is_file():
+                        image_bytes = image_file.read_bytes()
+                    else:
+                        report.errors += 1
+                except Exception as exc:
+                    report.errors += 1
+                    logger.debug("Image caption read failed for %s: %s", target, exc)
+
+            if processor is not None and image_bytes:
+                context = page_contexts.get(page_no)
+                if context is None:
+                    context = self._page_text_context(markdown, page_no)
+                    page_contexts[page_no] = context
+                digest = hashlib.sha256(image_bytes).hexdigest()
+                if reuse and digest in failed_digests:
+                    # 同内容图已经确认 VLM 失败过，不再为重复图浪费重试。
+                    pass
+                else:
+                    cached = caption_cache.get(digest) if reuse else ""
+                    if cached:
+                        replacement = cached
+                        report.reused += 1
+                    else:
+                        # 第 2 层：空/占位/异常最多重试一次，用更严格的提示词。
+                        for attempt, instruction in enumerate(
+                            (self._CAPTION_INSTRUCTION, self._CAPTION_RETRY_INSTRUCTION)
+                        ):
+                            if attempt:
+                                report.vlm_retries += 1
+                            report.vlm_calls += 1
+                            try:
+                                result = await asyncio.wait_for(
+                                    processor.understand_image(
+                                        image_bytes, context=context, instruction=instruction
+                                    ),
+                                    timeout=timeout,
+                                )
+                                caption = _clean_caption(getattr(result, "abstract", ""), limit)
+                            except Exception as exc:
+                                logger.debug(
+                                    "Image caption VLM attempt %d failed for %s: %s",
+                                    attempt + 1,
+                                    target,
+                                    exc,
+                                )
+                                caption = ""
+                            if is_semantic_caption(caption, document_name, target):
+                                replacement = caption
+                                report.captioned += 1
+                                if reuse:
+                                    caption_cache[digest] = caption
+                                break
+                        if not replacement and reuse:
+                            failed_digests.add(digest)
+
+            # 复用关闭但 VLM 没给出更好结果时，保留已有语义 alt，绝不回退占位。
+            if not replacement and existing_semantic:
+                replacement = _clean_caption(raw_alt, limit)
+                report.reused += 1
+
+            # 第 3 层：同页可定位文本兜底，形状「<小节标题>（图 N）」。
+            if not replacement:
+                body = page_bodies.get(page_no)
+                if body is None:
+                    body = self._page_body(markdown, page_no)
+                    page_bodies[page_no] = body
+                fallback = self._fallback_alt(
+                    markdown,
+                    match.start(),
+                    page_no,
+                    image_no,
+                    document_name,
+                    limit,
+                    page_body=body,
+                    image_name=target,
+                )
+                if fallback:
+                    replacement = fallback
+                    report.fallback += 1
+
+            # 第 4 层：无任何线索，保留占位并计数，由末尾聚合 WARNING 暴露。
+            if not replacement:
+                report.uncaptioned += 1
+                if len(report.uncaptioned_samples) < 5:
+                    report.uncaptioned_samples.append(target)
+                parts.append(match.group(0))
+            else:
+                safe_alt = _clean_caption(replacement, limit)
+                parts.append(f"![{safe_alt}]({raw_target})")
+
         parts.append(markdown[cursor:])
-        return "".join(parts)
+        output = "".join(parts)
 
-    _PAGE_BLOCK = re.compile(r"<!--\s*Page\s+(\d+)[^>]*-->")
+        problems = report.problems()
+        if problems:
+            logger.error("Image caption accounting invariant violated: %s", "; ".join(problems))
+        audit = audit_image_alts(output, document_name)
+        expected_semantic = report.captioned + report.fallback + report.reused
+        if (
+            audit.total != report.images_total
+            or audit.semantic != expected_semantic
+            or len(audit.invalid) != report.uncaptioned
+        ):
+            logger.warning(
+                "Image caption output audit drift: total=%d/%d semantic=%d/%d uncaptioned=%d/%d",
+                audit.total,
+                report.images_total,
+                audit.semantic,
+                expected_semantic,
+                len(audit.invalid),
+                report.uncaptioned,
+            )
 
-    def _page_text_context(self, markdown: str, page_no: str, limit: int = 500) -> str:
-        """取该页正文（去掉图片引用与注释）作为图注上下文。"""
-        blocks = list(self._PAGE_BLOCK.finditer(markdown))
+        # 只打聚合日志：单图失败不再逐条 WARNING，避免 244 图刷屏。
+        logger.info(
+            "PDF image captions: total=%d captioned=%d fallback=%d reused=%d "
+            "uncaptioned=%d vlm_calls=%d retries=%d errors=%d",
+            report.images_total,
+            report.captioned,
+            report.fallback,
+            report.reused,
+            report.uncaptioned,
+            report.vlm_calls,
+            report.vlm_retries,
+            report.errors,
+        )
+        if report.uncaptioned:
+            logger.warning(
+                "PDF image captions: %d/%d image(s) left without semantic alt "
+                "(no same-page clue and VLM failed): %s",
+                report.uncaptioned,
+                report.images_total,
+                ", ".join(report.uncaptioned_samples),
+            )
+        return output, report
+
+    @staticmethod
+    def _locate_image(markdown: str, match: re.Match, fallback_index: int) -> tuple[str, str]:
+        """定位图片所属页/序号：优先占位 alt，其次最近的图片/页面注释。"""
+        placeholder = re.match(
+            r"^Page\s+(\d+)\s+Image\s+(\d+)$",
+            _normalize_alt(match.group(1)),
+            re.IGNORECASE,
+        )
+        if placeholder:
+            return placeholder.group(1), placeholder.group(2)
+
+        prefix = markdown[: match.start()]
+        image_markers = list(_IMAGE_MARKER_RE.finditer(prefix))
+        if image_markers:
+            last = image_markers[-1]
+            # 中间不能再有别的图片引用，否则这个注释属于更早的图。
+            if not _IMAGE_REF_RE.search(markdown[last.end() : match.start()]):
+                return last.group(1), last.group(2)
+
+        page_markers = list(_PAGE_MARKER_RE.finditer(prefix))
+        if page_markers:
+            last_page = page_markers[-1]
+            segment = markdown[last_page.end() : match.start()]
+            return last_page.group(1), str(len(_IMAGE_REF_RE.findall(segment)) + 1)
+        return "", str(fallback_index)
+
+    def _fallback_alt(
+        self,
+        markdown: str,
+        match_start: int,
+        page_no: str,
+        image_no: str,
+        document_name: str,
+        limit: int,
+        page_body: Optional[str] = None,
+        image_name: str = "",
+    ) -> str:
+        """用同页可定位文本生成可追溯 alt；无线索时返回空串（由调用方计数）。"""
+        heading = self._nearest_heading_text(markdown, match_start)
+        clue = (
+            heading
+            if heading and is_semantic_caption(heading, document_name, image_name)
+            else ""
+        )
+        if not clue and page_no:
+            body = page_body if page_body is not None else self._page_body(markdown, page_no)
+            sentence = self._first_sentence(body)
+            if sentence and is_semantic_caption(sentence, document_name, image_name):
+                clue = sentence
+        if not clue:
+            return ""
+        suffix = f"（图 {image_no}）"
+        clue = self._clip_clue(clue, max(1, limit - len(suffix)))
+        return f"{clue}{suffix}" if clue else ""
+
+    @staticmethod
+    def _clip_clue(clue: str, limit: int) -> str:
+        """把标题/首句裁到指定长度，优先在标点处断开，避免 alt 停在半个词上。"""
+        clue = " ".join((clue or "").split())
+        if len(clue) <= limit:
+            return clue
+        window = clue[:limit]
+        cut = max(window.rfind(ch) for ch in "，,、；;：: ")
+        if cut >= 2:
+            window = window[:cut]
+        return window.rstrip("，,、；;：: ")
+
+    @staticmethod
+    def _nearest_heading_text(markdown: str, position: int, scan_chars: int = 20000) -> str:
+        """取图片之前最近的 markdown 标题；只回看有限窗口，避免整篇扫描。"""
+        window = markdown[max(0, position - scan_chars) : position]
+        matches = list(_HEADING_LINE_RE.finditer(window))
+        if not matches:
+            return ""
+        title = re.sub(r"[*_`]+", "", matches[-1].group(2))
+        title = re.sub(r"<[^>]+>", " ", title)
+        return " ".join(title.split()).strip(" #")
+
+    @staticmethod
+    def _first_sentence(text: str, limit: int = 40) -> str:
+        text = " ".join((text or "").split()).strip()
+        if not text:
+            return ""
+        match = re.search(r"[。！？!?；;]", text)
+        sentence = text[: match.end()] if match else text
+        sentence = " ".join(sentence.strip(" #*-•·|　").split())
+        return PDFParser._clip_clue(sentence, limit)
+
+    @staticmethod
+    def _page_body(markdown: str, page_no: str) -> str:
+        """取 `<!-- Page N -->` 到下一页标记之间的正文（去图片/注释/HTML/标题）。
+
+        解析器把下一页的标题插在下一页 page marker 之前，因此这里剔除标题行，
+        避免把下一节的标题当成当前页正文（标题由 `_nearest_heading_text` 单独取）。
+        """
+        blocks = list(_PAGE_MARKER_RE.finditer(markdown))
         for index, block in enumerate(blocks):
             if block.group(1) != str(page_no):
                 continue
             end = blocks[index + 1].start() if index + 1 < len(blocks) else len(markdown)
             text = markdown[block.end() : end]
-            text = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", text)
+            text = _IMAGE_REF_RE.sub(" ", text)
             text = re.sub(r"<!--.*?-->", " ", text, flags=re.S)
-            return " ".join(text.split())[:limit]
+            text = re.sub(r"<[^>]+>", " ", text)
+            text = _HEADING_LINE_RE.sub(" ", text)
+            return " ".join(text.split())
         return ""
+
+    def _page_text_context(self, markdown: str, page_no: str, limit: int = 500) -> str:
+        """取该页正文 + 最近章节标题作为图注上下文。"""
+        body = self._page_body(markdown, page_no)
+        if not body:
+            return ""
+        marker = next(
+            (m for m in _PAGE_MARKER_RE.finditer(markdown) if m.group(1) == str(page_no)),
+            None,
+        )
+        heading = self._nearest_heading_text(markdown, marker.start()) if marker else ""
+        text = f"{heading} {body}" if heading and heading not in body else body
+        return " ".join(text.split())[:limit]
 
     def _convert_local_sync(
         self, pdf_path: Path, storage=None, resource_name: Optional[str] = None

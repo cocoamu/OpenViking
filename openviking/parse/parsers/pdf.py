@@ -304,6 +304,15 @@ class PDFParser(BaseParser):
             # Allocator availability or cleanup must not change a parse result.
             logger.debug("Large PDF memory reclaim unavailable", exc_info=True)
 
+    # EXEPD-230261：图注要能直接回答「这张图是什么」——名称优先用同页正文里的说法，
+    # 否则模型只能看到 [图片:hash]，符号类小图会被张冠李戴。
+    _CAPTION_INSTRUCTION = (
+        "这是知识文档中的一张小图。请用不超过 20 个字给出它的名称与含义，"
+        "并写在 abstract 的最开头；名称优先采用 Surrounding Text Context 里出现的说法"
+        "（例如「不可水洗」「最高洗涤30℃」「悬挂滴干」）。"
+        "图里若标有数字或字母（如 30、40、110℃），必须原样写进 abstract。"
+    )
+
     async def _caption_images(self, markdown: str, storage) -> str:
         """把 `![Page N Image M](path)` 的 alt 换成图片内容描述。
 
@@ -338,7 +347,11 @@ class PDFParser(BaseParser):
                 if not image_file.is_file():
                     return match.group(0)
                 image_bytes = image_file.read_bytes()
-                result = await processor.understand_image(image_bytes)
+                result = await processor.understand_image(
+                    image_bytes,
+                    context=self._page_text_context(markdown, page_no),
+                    instruction=self._CAPTION_INSTRUCTION,
+                )
                 caption = (result.abstract or "").strip()
                 # 模型没识别出来时会给 "[Image]" 这类占位，别写进 alt。
                 if not caption or caption.startswith("["):
@@ -358,6 +371,21 @@ class PDFParser(BaseParser):
             cursor = match.end()
         parts.append(markdown[cursor:])
         return "".join(parts)
+
+    _PAGE_BLOCK = re.compile(r"<!--\s*Page\s+(\d+)[^>]*-->")
+
+    def _page_text_context(self, markdown: str, page_no: str, limit: int = 500) -> str:
+        """取该页正文（去掉图片引用与注释）作为图注上下文。"""
+        blocks = list(self._PAGE_BLOCK.finditer(markdown))
+        for index, block in enumerate(blocks):
+            if block.group(1) != str(page_no):
+                continue
+            end = blocks[index + 1].start() if index + 1 < len(blocks) else len(markdown)
+            text = markdown[block.end() : end]
+            text = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", text)
+            text = re.sub(r"<!--.*?-->", " ", text, flags=re.S)
+            return " ".join(text.split())[:limit]
+        return ""
 
     def _convert_local_sync(
         self, pdf_path: Path, storage=None, resource_name: Optional[str] = None

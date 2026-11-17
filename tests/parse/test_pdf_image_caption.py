@@ -497,3 +497,18 @@ def test_identical_image_failure_is_not_retried_twice(media, install_vlm):
     assert meta["fallback"] == 2
     assert meta["uncaptioned"] == 0
     assert "（图 1）" in out and out.count("（图 1）") == 2
+
+
+def test_leading_image_without_page_uses_next_heading():
+    """EXEPD-230261：文档/章节开头的首图（page=None）没有前置标题，用它后面那一节标题兜底。"""
+    parser = PDFParser(PDFConfig(image_caption=True))
+    markdown = "![Page 1 Image 1](page1_img1.png)\n\n# 店长销售管理办法\n\n正文：店长月度考核与奖惩标准。\n"
+    caption = parser._fallback_alt(
+        markdown,
+        markdown.index("!["),
+        "",
+        "1",
+        "店长销售管理办法-OBC-2026-59.pdf",
+        60,
+    )
+    assert caption == "店长销售管理办法（图 1）"

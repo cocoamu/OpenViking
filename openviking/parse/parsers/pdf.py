@@ -791,6 +791,10 @@ class PDFParser(BaseParser):
     ) -> str:
         """用同页可定位文本生成可追溯 alt；无线索时返回空串（由调用方计数）。"""
         heading = self._nearest_heading_text(markdown, match_start)
+        # 文档/章节开头的图前面没有任何标题（page=None 的首图就是这样）：它属于**紧随其后**
+        # 的那一节，用后面的标题做线索仍然是可追溯的，比留占位或回落到文档名更准确。
+        if not heading:
+            heading = self._next_heading_text(markdown, match_start)
         clue = (
             heading
             if heading and is_semantic_caption(heading, document_name, image_name)
@@ -827,6 +831,17 @@ class PDFParser(BaseParser):
         if not matches:
             return ""
         title = re.sub(r"[*_`]+", "", matches[-1].group(2))
+        title = re.sub(r"<[^>]+>", " ", title)
+        return " ".join(title.split()).strip(" #")
+
+    @staticmethod
+    def _next_heading_text(markdown: str, position: int, scan_chars: int = 4000) -> str:
+        """取图片之后最近的 markdown 标题（只回看有限窗口，避免跨章节串味）。"""
+        window = markdown[position : position + scan_chars]
+        matches = list(_HEADING_LINE_RE.finditer(window))
+        if not matches:
+            return ""
+        title = re.sub(r"[*_`]+", "", matches[0].group(2))
         title = re.sub(r"<[^>]+>", " ", title)
         return " ".join(title.split()).strip(" #")
 
